@@ -156,17 +156,17 @@ pub struct CpuInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiskInfo {
-	name: String,
-	mount_path: String,
-	filesystem: String,
-	total_space: u64,
-	available_space: u64,
-	usage_percent: f32,
-	total_read_bytes: u64,
-	total_written_bytes: u64,
-	read_only: bool,
-	removable: bool,
-	kind: String,
+	pub name: String,
+	pub mount_path: String,
+	pub filesystem: String,
+	pub total_space: u64,
+	pub available_space: u64,
+	pub usage_percent: f32,
+	pub total_read_bytes: u64,
+	pub total_written_bytes: u64,
+	pub read_only: bool,
+	pub removable: bool,
+	pub kind: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

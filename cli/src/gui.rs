@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::mem;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,7 +15,7 @@ use iced::widget::{
 };
 use iced::{Application, Command, Element, Length, Settings, Subscription, Theme};
 use libp2p::PeerId;
-use puppypeer_core::p2p::{CpuInfo, DirEntry};
+use puppypeer_core::p2p::{CpuInfo, DirEntry, DiskInfo};
 use puppypeer_core::{
 	FLAG_READ, FLAG_SEARCH, FLAG_WRITE, FileChunk, FolderRule, Permission, PuppyPeer, Rule, State,
 };
@@ -165,6 +165,8 @@ struct FileBrowserState {
 	loading: bool,
 	error: Option<String>,
 	available_roots: Vec<String>,
+	disks: Vec<DiskInfo>,
+	showing_disks: bool,
 }
 
 impl FileBrowserState {
@@ -176,6 +178,18 @@ impl FileBrowserState {
 			loading: true,
 			error: None,
 			available_roots: Vec::new(),
+			disks: Vec::new(),
+			showing_disks: should_list_disks_first(),
+		}
+	}
+
+	fn display_path(&self) -> String {
+		if self.showing_disks {
+			String::from("Disks")
+		} else if self.path.trim().is_empty() {
+			String::from("/")
+		} else {
+			self.path.clone()
 		}
 	}
 }
@@ -373,6 +387,15 @@ async fn list_granted_permissions(
 	(peer_id, result.map_err(|err| format!("{err}")))
 }
 
+async fn list_disks(
+	peer: Arc<PuppyPeer>,
+	peer_id: String,
+) -> (String, Result<Vec<DiskInfo>, String>) {
+	let target = PeerId::from_str(&peer_id).unwrap();
+	let result = peer.list_disks(target).await;
+	(peer_id, map_result(result))
+}
+
 async fn set_permissions(
 	peer: Arc<PuppyPeer>,
 	peer_id: String,
@@ -457,6 +480,14 @@ pub enum GuiMessage {
 	CpuLoaded(String, Result<Vec<CpuInfo>, String>),
 	FileBrowserRequested {
 		peer_id: String,
+	},
+	FileBrowserDisksLoaded {
+		peer_id: String,
+		disks: Result<Vec<DiskInfo>, String>,
+	},
+	FileBrowserDiskSelected {
+		peer_id: String,
+		disk_path: String,
 	},
 	FileBrowserPermissionsLoaded {
 		peer_id: String,
@@ -744,7 +775,12 @@ impl Application for GuiApp {
 				Command::none()
 			}
 			GuiMessage::FileBrowserRequested { peer_id } => {
-				self.status = format!("Fetching shared folders for {}...", peer_id);
+				let use_disks = should_list_disks_first();
+				self.status = if use_disks {
+					format!("Fetching disks for {}...", peer_id)
+				} else {
+					format!("Fetching shared folders for {}...", peer_id)
+				};
 				self.mode =
 					Mode::FileBrowser(FileBrowserState::new(peer_id.clone(), String::new()));
 				self.selected_peer_id = Some(peer_id.clone());
@@ -753,6 +789,18 @@ impl Application for GuiApp {
 					state.loading = true;
 					state.error = None;
 					state.available_roots.clear();
+					state.disks.clear();
+					state.showing_disks = use_disks;
+					if use_disks {
+						state.path.clear();
+					}
+				}
+				if use_disks {
+					let peer = self.peer.clone();
+					return Command::perform(
+						list_disks(peer, peer_id.clone()),
+						|(peer_id, disks)| GuiMessage::FileBrowserDisksLoaded { peer_id, disks },
+					);
 				}
 				let peer = self.peer.clone();
 				Command::perform(
@@ -763,53 +811,102 @@ impl Application for GuiApp {
 					},
 				)
 			}
+			GuiMessage::FileBrowserDisksLoaded { peer_id, disks } => {
+				if let Mode::FileBrowser(state) = &mut self.mode {
+					if state.peer_id == peer_id {
+						state.loading = false;
+						match disks {
+							Ok(list) => {
+								state.disks = list;
+								state.entries.clear();
+								state.error = None;
+								self.status = format!("Select a disk on {}", peer_id);
+							}
+							Err(err) => {
+								state.disks.clear();
+								state.error = Some(err.clone());
+								self.status = format!("Failed to load disks: {}", err);
+							}
+						}
+					}
+				}
+				Command::none()
+			}
+			GuiMessage::FileBrowserDiskSelected { peer_id, disk_path } => {
+				if let Mode::FileBrowser(state) = &mut self.mode {
+					if state.peer_id == peer_id {
+						state.showing_disks = false;
+						state.path = disk_path.clone();
+						state.available_roots = vec![normalize_path(&state.path)];
+						state.entries.clear();
+						state.loading = true;
+						state.error = None;
+						self.status = format!("Listing {} on {}...", disk_path, peer_id);
+						let peer = self.peer.clone();
+						return Command::perform(
+							list_dir(peer, peer_id.clone(), disk_path),
+							|(peer_id, path, entries)| GuiMessage::FileBrowserLoaded {
+								peer_id,
+								path,
+								entries,
+							},
+						);
+					}
+				}
+				Command::none()
+			}
 			GuiMessage::FileBrowserPermissionsLoaded {
 				peer_id,
 				permissions,
-			} => match permissions {
-				Ok(perms) => {
-					let default_path =
-						default_browser_path(&perms).unwrap_or_else(|| String::from("/"));
-					let list_path = default_path.clone();
-					let status_path = default_path.clone();
-					let roots = permissions_roots(&perms);
-					self.status = format!("Listing {} on {}...", status_path, peer_id);
-					match &mut self.mode {
-						Mode::FileBrowser(state) if state.peer_id == peer_id => {
-							state.path = default_path.clone();
-							state.available_roots = roots.clone();
-							state.entries.clear();
-							state.loading = true;
-							state.error = None;
-						}
-						_ => {
-							let mut state =
-								FileBrowserState::new(peer_id.clone(), default_path.clone());
-							state.available_roots = roots.clone();
-							self.mode = Mode::FileBrowser(state);
-						}
-					}
-					let peer = self.peer.clone();
-					return Command::perform(
-						list_dir(peer, peer_id.clone(), list_path),
-						|(peer_id, path, entries)| GuiMessage::FileBrowserLoaded {
-							peer_id,
-							path,
-							entries,
-						},
-					);
-				}
-				Err(err) => {
-					self.status = format!("Failed to fetch permissions: {}", err);
-					if let Mode::FileBrowser(state) = &mut self.mode {
-						if state.peer_id == peer_id {
-							state.loading = false;
-							state.error = Some(err.clone());
-						}
-					}
+			} => {
+				if should_list_disks_first() {
 					return Command::none();
 				}
-			},
+				match permissions {
+					Ok(perms) => {
+						let default_path =
+							default_browser_path(&perms).unwrap_or_else(|| String::from("/"));
+						let list_path = default_path.clone();
+						let status_path = default_path.clone();
+						let roots = permissions_roots(&perms);
+						self.status = format!("Listing {} on {}...", status_path, peer_id);
+						match &mut self.mode {
+							Mode::FileBrowser(state) if state.peer_id == peer_id => {
+								state.path = default_path.clone();
+								state.available_roots = roots.clone();
+								state.entries.clear();
+								state.loading = true;
+								state.error = None;
+							}
+							_ => {
+								let mut state =
+									FileBrowserState::new(peer_id.clone(), default_path.clone());
+								state.available_roots = roots.clone();
+								self.mode = Mode::FileBrowser(state);
+							}
+						}
+						let peer = self.peer.clone();
+						return Command::perform(
+							list_dir(peer, peer_id.clone(), list_path),
+							|(peer_id, path, entries)| GuiMessage::FileBrowserLoaded {
+								peer_id,
+								path,
+								entries,
+							},
+						);
+					}
+					Err(err) => {
+						self.status = format!("Failed to fetch permissions: {}", err);
+						if let Mode::FileBrowser(state) = &mut self.mode {
+							if state.peer_id == peer_id {
+								state.loading = false;
+								state.error = Some(err.clone());
+							}
+						}
+						return Command::none();
+					}
+				}
+			}
 			GuiMessage::FileBrowserLoaded {
 				peer_id,
 				path,
@@ -838,6 +935,9 @@ impl Application for GuiApp {
 			}
 			GuiMessage::FileEntryActivated(entry) => {
 				if let Mode::FileBrowser(state) = &mut self.mode {
+					if state.showing_disks {
+						return Command::none();
+					}
 					if entry.is_dir {
 						let target = join_child_path(&state.path, &entry.name);
 						let peer_id = state.peer_id.clone();
@@ -847,9 +947,8 @@ impl Application for GuiApp {
 						state.error = None;
 						self.status = format!("Opening {}...", target);
 						let peer = self.peer.clone();
-						let local = self.local_peer_id.clone();
 						return Command::perform(
-							list_dir(peer, peer_id.parse().unwrap(), target),
+							list_dir(peer, peer_id.clone(), target),
 							|(peer_id, path, entries)| GuiMessage::FileBrowserLoaded {
 								peer_id,
 								path,
@@ -868,7 +967,6 @@ impl Application for GuiApp {
 						mime_label
 					);
 					let peer = self.peer.clone();
-					let local = self.local_peer_id.clone();
 					let command = Command::perform(
 						read_file(peer, peer_id.clone(), target.clone(), 0),
 						|(peer_id, path, offset, result)| GuiMessage::FileReadLoaded {
@@ -890,6 +988,10 @@ impl Application for GuiApp {
 			}
 			GuiMessage::FileNavigateUp => {
 				if let Mode::FileBrowser(state) = &mut self.mode {
+					if state.showing_disks {
+						self.status = String::from("Select a disk to browse");
+						return Command::none();
+					}
 					let current = normalize_path(&state.path);
 					if state.available_roots.iter().any(|root| root == &current) {
 						self.status = String::from("Already at shared root");
@@ -907,9 +1009,8 @@ impl Application for GuiApp {
 					state.error = None;
 					self.status = format!("Opening {}...", target);
 					let peer = self.peer.clone();
-					let local = self.local_peer_id.clone();
 					return Command::perform(
-						list_dir(peer, peer_id.parse().unwrap(), target),
+						list_dir(peer, peer_id.clone(), target),
 						|(peer_id, path, entries)| GuiMessage::FileBrowserLoaded {
 							peer_id,
 							path,
@@ -1008,7 +1109,6 @@ impl Application for GuiApp {
 					let offset = state.offset;
 					self.status = format!("Loading bytes starting at {}...", offset);
 					let peer = self.peer.clone();
-					let local = self.local_peer_id.clone();
 					return Command::perform(
 						read_file(peer, peer_id, path.clone(), offset),
 						|(peer_id, path, offset, result)| GuiMessage::FileReadLoaded {
@@ -1439,36 +1539,71 @@ impl GuiApp {
 
 	fn view_file_browser(&self, state: &FileBrowserState) -> Element<'_, GuiMessage> {
 		let mut layout = iced::widget::Column::new().spacing(12);
-		layout =
-			layout.push(text(format!("Browsing {} on {}", state.path, state.peer_id)).size(24));
+		layout = layout.push(
+			text(format!(
+				"Browsing {} on {}",
+				state.display_path(),
+				state.peer_id
+			))
+			.size(24),
+		);
+		let mut up_button = button(text("Up"));
+		if state.showing_disks {
+			up_button = up_button.style(theme::Button::Secondary);
+		} else {
+			up_button = up_button.on_press(GuiMessage::FileNavigateUp);
+		}
 		let controls = iced::widget::Row::new()
 			.spacing(12)
-			.push(button(text("Up")).on_press(GuiMessage::FileNavigateUp))
+			.push(up_button)
 			.push(
 				button(text("Back to actions"))
 					.on_press(GuiMessage::PeerActionsRequested(state.peer_id.clone())),
 			);
 		layout = layout.push(controls);
-		if state.loading {
-			layout = layout.push(text("Loading directory...").size(16));
-		} else if let Some(err) = &state.error {
-			layout = layout.push(text(format!("Error: {}", err)).size(16));
-		} else if state.entries.is_empty() {
-			layout = layout.push(text("Directory is empty").size(16));
-		} else {
-			let mut list = iced::widget::Column::new().spacing(4);
-			for entry in &state.entries {
-				let label = if entry.is_dir {
-					format!("[DIR] {}", entry.name)
-				} else {
-					format!("{} ({})", entry.name, format_size(entry.size))
-				};
-				let button = button(text(label))
-					.width(Length::Fill)
-					.on_press(GuiMessage::FileEntryActivated(entry.clone()));
-				list = list.push(button);
+		if state.showing_disks {
+			if state.loading {
+				layout = layout.push(text("Loading disks...").size(16));
+			} else if let Some(err) = &state.error {
+				layout = layout.push(text(format!("Error: {}", err)).size(16));
+			} else if state.disks.is_empty() {
+				layout = layout.push(text("No disks were reported").size(16));
+			} else {
+				let mut list = iced::widget::Column::new().spacing(4);
+				for disk in &state.disks {
+					let label = format_disk_label(disk);
+					let button = button(text(label))
+						.width(Length::Fill)
+						.on_press(GuiMessage::FileBrowserDiskSelected {
+							peer_id: state.peer_id.clone(),
+							disk_path: disk.mount_path.clone(),
+						});
+					list = list.push(button);
+				}
+				layout = layout.push(scrollable(list).height(Length::Fill));
 			}
-			layout = layout.push(scrollable(list).height(Length::Fill));
+		} else {
+			if state.loading {
+				layout = layout.push(text("Loading directory...").size(16));
+			} else if let Some(err) = &state.error {
+				layout = layout.push(text(format!("Error: {}", err)).size(16));
+			} else if state.entries.is_empty() {
+				layout = layout.push(text("Directory is empty").size(16));
+			} else {
+				let mut list = iced::widget::Column::new().spacing(4);
+				for entry in &state.entries {
+					let label = if entry.is_dir {
+						format!("[DIR] {}", entry.name)
+					} else {
+						format!("{} ({})", entry.name, format_size(entry.size))
+					};
+					let button = button(text(label))
+						.width(Length::Fill)
+						.on_press(GuiMessage::FileEntryActivated(entry.clone()));
+					list = list.push(button);
+				}
+				layout = layout.push(scrollable(list).height(Length::Fill));
+			}
 		}
 		layout.into()
 	}
@@ -1788,6 +1923,19 @@ fn format_size(bytes: u64) -> String {
 	}
 }
 
+fn format_disk_label(disk: &DiskInfo) -> String {
+	let total = format_size(disk.total_space);
+	let free = format_size(disk.available_space);
+	let mut label = format!("{} ({}) — {} free of {}", disk.mount_path, disk.name, free, total);
+	if disk.read_only {
+		label.push_str(" [read-only]");
+	}
+	if disk.removable {
+		label.push_str(" [removable]");
+	}
+	label
+}
+
 fn file_preview_text(data: &[u8]) -> (String, bool) {
 	match std::str::from_utf8(data) {
 		Ok(text) => (text.to_string(), false),
@@ -1824,11 +1972,14 @@ fn normalize_path(path: &str) -> String {
 	if trimmed.is_empty() {
 		return String::from("/");
 	}
-	let without_slash = trimmed.trim_end_matches('/');
-	if without_slash.is_empty() {
+	if should_list_disks_first() && is_windows_drive_root(trimmed) {
+		return normalize_windows_drive(trimmed);
+	}
+	let without_sep = trimmed.trim_end_matches(|c| path_separators().contains(&c));
+	if without_sep.is_empty() {
 		String::from("/")
 	} else {
-		without_slash.to_string()
+		without_sep.to_string()
 	}
 }
 
@@ -1856,31 +2007,90 @@ fn default_browser_path(permissions: &[Permission]) -> Option<String> {
 }
 
 fn join_child_path(base: &str, child: &str) -> String {
-	if base.is_empty() || base == "/" {
-		format!("/{}", child.trim_start_matches('/'))
-	} else {
-		format!(
-			"{}/{}",
-			base.trim_end_matches('/'),
-			child.trim_start_matches('/')
-		)
+	let trimmed_child = child.trim_matches(|c| path_separators().contains(&c));
+	if base.is_empty() {
+		return if trimmed_child.is_empty() {
+			String::from("/")
+		} else {
+			trimmed_child.to_string()
+		};
 	}
+	let mut path = PathBuf::from(base);
+	if !trimmed_child.is_empty() {
+		path.push(trimmed_child);
+	}
+	path.to_string_lossy().to_string()
 }
 
 fn parent_path(path: &str) -> String {
-	let trimmed = path.trim_end_matches('/');
+	if path.is_empty() {
+		return String::from("/");
+	}
+	if should_list_disks_first() && is_windows_drive_root(path) {
+		return normalize_windows_drive(path);
+	}
+	let trimmed = path.trim_end_matches(|c| path_separators().contains(&c));
 	if trimmed.is_empty() || trimmed == "/" {
 		return String::from("/");
 	}
-	if let Some(pos) = trimmed.rfind('/') {
-		if pos == 0 {
-			String::from("/")
-		} else {
-			trimmed[..pos].to_string()
+	let parent = Path::new(trimmed).parent();
+	if let Some(parent) = parent {
+		let parent_str = parent.to_string_lossy().to_string();
+		if parent_str.is_empty() && should_list_disks_first() && is_windows_drive_root(trimmed) {
+			return normalize_windows_drive(trimmed);
 		}
-	} else {
-		String::from("/")
+		if parent_str.is_empty() {
+			return String::from("/");
+		}
+		if should_list_disks_first() && is_windows_drive_root(&parent_str) {
+			return normalize_windows_drive(&parent_str);
+		}
+		return parent_str;
 	}
+	String::from("/")
+}
+
+#[cfg(target_os = "windows")]
+const PATH_SEPARATORS: [char; 2] = ['/', '\\'];
+#[cfg(not(target_os = "windows"))]
+const PATH_SEPARATORS: [char; 1] = ['/'];
+
+fn path_separators() -> &'static [char] {
+	&PATH_SEPARATORS
+}
+
+fn should_list_disks_first() -> bool {
+	cfg!(target_os = "windows")
+}
+
+fn is_windows_drive_root(path: &str) -> bool {
+	if !should_list_disks_first() {
+		return false;
+	}
+	let trimmed = path.trim();
+	if trimmed.len() < 2 {
+		return false;
+	}
+	let mut chars = trimmed.chars();
+	let drive = chars.next().unwrap();
+	if !drive.is_ascii_alphabetic() {
+		return false;
+	}
+	if chars.next() != Some(':') {
+		return false;
+	}
+	let remainder: String = chars.collect();
+	remainder.is_empty() || remainder == "\\" || remainder == "/"
+}
+
+fn normalize_windows_drive(path: &str) -> String {
+	let trimmed = path.trim();
+	if trimmed.len() < 2 {
+		return trimmed.to_string();
+	}
+	let mut drive = trimmed[..2].to_string();
+	drive.push('\\');
+	drive
 }
 
 async fn fetch_cpus(

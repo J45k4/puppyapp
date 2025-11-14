@@ -1,4 +1,6 @@
-use crate::p2p::{AuthMethod, CpuInfo, DirEntry, FileWriteAck, InterfaceInfo, PeerReq, PeerRes};
+use crate::p2p::{
+	AuthMethod, CpuInfo, DirEntry, DiskInfo, FileWriteAck, InterfaceInfo, PeerReq, PeerRes,
+};
 use crate::types::FileChunk;
 use crate::{
 	db::{load_peer_permissions, open_db, run_migrations},
@@ -16,7 +18,7 @@ use std::{
 	env,
 	path::{Path, PathBuf},
 };
-use sysinfo::{Networks, System};
+use sysinfo::{Disks, Networks, System};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::{
@@ -49,6 +51,10 @@ pub enum Command {
 	},
 	ListCpus {
 		tx: oneshot::Sender<Result<Vec<CpuInfo>>>,
+		peer_id: PeerId,
+	},
+	ListDisks {
+		tx: oneshot::Sender<Result<Vec<DiskInfo>>>,
 		peer_id: PeerId,
 	},
 	ListPermissions {
@@ -152,6 +158,15 @@ impl ResponseDecoder for Vec<CpuInfo> {
 	fn decode(response: PeerRes) -> anyhow::Result<Self> {
 		match response {
 			PeerRes::Cpus(cpus) => Ok(cpus),
+			other => Err(anyhow!("unexpected response: {:?}", other)),
+		}
+	}
+}
+
+impl ResponseDecoder for Vec<DiskInfo> {
+	fn decode(response: PeerRes) -> anyhow::Result<Self> {
+		match response {
+			PeerRes::Disks(disks) => Ok(disks),
 			other => Err(anyhow!("unexpected response: {:?}", other)),
 		}
 	}
@@ -433,7 +448,10 @@ impl App {
 				let cpus = self.collect_cpu_info();
 				PeerRes::Cpus(cpus)
 			}
-			PeerReq::ListDisks => PeerRes::Error("ListDisks not implemented".into()),
+			PeerReq::ListDisks => {
+				let disks = self.collect_disk_info();
+				PeerRes::Disks(disks)
+			}
 			PeerReq::ListInterfaces => {
 				let networks = Networks::new_with_refreshed_list();
 				let infos = networks
@@ -514,6 +532,37 @@ impl App {
 				name: cpu.name().to_string(),
 				usage: cpu.cpu_usage(),
 				frequency_hz: cpu.frequency(),
+				})
+				.collect()
+	}
+
+	fn collect_disk_info(&self) -> Vec<DiskInfo> {
+		let disks = Disks::new_with_refreshed_list();
+		disks
+			.iter()
+			.map(|disk| {
+				let total_space = disk.total_space();
+				let available_space = disk.available_space();
+				let usage_percent = if total_space == 0 {
+					0.0
+				} else {
+					let used = total_space.saturating_sub(available_space);
+					((used as f64 / total_space as f64) * 100.0) as f32
+				};
+				let usage = disk.usage();
+				DiskInfo {
+					name: disk.name().to_string_lossy().to_string(),
+					mount_path: disk.mount_point().to_string_lossy().to_string(),
+					filesystem: disk.file_system().to_string_lossy().to_string(),
+					total_space,
+					available_space,
+					usage_percent,
+					total_read_bytes: usage.total_read_bytes,
+					total_written_bytes: usage.total_written_bytes,
+					read_only: disk.is_read_only(),
+					removable: disk.is_removable(),
+					kind: format!("{:?}", disk.kind()),
+				}
 			})
 			.collect()
 	}
@@ -791,6 +840,20 @@ impl App {
 				self.pending_requests
 					.insert(request_id, Pending::<Vec<CpuInfo>>::new(tx));
 			}
+			Command::ListDisks { tx, peer_id } => {
+				if self.state.lock().unwrap().me == peer_id {
+					let disks = self.collect_disk_info();
+					let _ = tx.send(Ok(disks));
+					return;
+				}
+				let request_id = self
+					.swarm
+					.behaviour_mut()
+					.puppypeer
+					.send_request(&peer_id, PeerReq::ListDisks);
+				self.pending_requests
+					.insert(request_id, Pending::<Vec<DiskInfo>>::new(tx));
+			}
 			Command::ListPermissions { peer, tx } => {
 				let local_permissions = match self.state.lock() {
 					Ok(state) => {
@@ -957,6 +1020,19 @@ impl PuppyPeer {
 
 	pub fn list_cpus_blocking(&self, peer_id: PeerId) -> Result<Vec<CpuInfo>> {
 		block_on(self.list_cpus(peer_id))
+	}
+
+	pub async fn list_disks(&self, peer_id: PeerId) -> Result<Vec<DiskInfo>> {
+		let (tx, rx) = oneshot::channel();
+		self.cmd_tx
+			.send(Command::ListDisks { tx, peer_id })
+			.map_err(|e| anyhow!("failed to send ListDisks command: {e}"))?;
+		rx.await
+			.map_err(|e| anyhow!("ListDisks response channel closed: {e}"))?
+	}
+
+	pub fn list_disks_blocking(&self, peer_id: PeerId) -> Result<Vec<DiskInfo>> {
+		block_on(self.list_disks(peer_id))
 	}
 
 	pub fn list_granted_permissions(&self, peer: PeerId) -> Result<Vec<Permission>> {
