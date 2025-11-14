@@ -1,4 +1,0 @@
-
-pub enum Command {
-	RemoveMe
-}
