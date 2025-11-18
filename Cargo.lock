@@ -4322,7 +4322,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "puppypeer"
+name = "puppynet"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -4333,7 +4333,7 @@ dependencies = [
  "iced",
  "libp2p",
  "log",
- "puppypeer_core",
+ "puppynet_core",
  "ratatui",
  "rayon",
  "reqwest",
@@ -4350,7 +4350,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "puppypeer_core"
+name = "puppynet_core"
 version = "0.1.0"
 dependencies = [
  "anyhow",

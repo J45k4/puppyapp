@@ -918,14 +918,14 @@ impl App {
 	}
 }
 
-pub struct PuppyPeer {
+pub struct PuppyNet {
 	shutdown_tx: Option<oneshot::Sender<()>>,
 	handle: JoinHandle<()>,
 	state: Arc<Mutex<State>>,
 	cmd_tx: UnboundedSender<Command>,
 }
 
-impl PuppyPeer {
+impl PuppyNet {
 	pub fn new() -> Self {
 		let state = Arc::new(Mutex::new(State::default()));
 		// channel to request shutdown
@@ -937,7 +937,7 @@ impl PuppyPeer {
 			loop {
 				tokio::select! {
 					_ = &mut shutdown_rx => {
-						log::info!("PuppyPeer shutting down");
+						log::info!("PuppyNet shutting down");
 						break;
 					}
 					_ = app.run() => {}
@@ -945,7 +945,7 @@ impl PuppyPeer {
 			}
 		});
 
-		PuppyPeer {
+		PuppyNet {
 			shutdown_tx: Some(shutdown_tx),
 			handle,
 			state,

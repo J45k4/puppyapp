@@ -11,8 +11,8 @@ use crossterm::{
 	terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use libp2p::PeerId;
-use puppypeer_core::{
-	PuppyPeer, State,
+use puppynet_core::{
+	PuppyNet, State,
 	p2p::{CpuInfo, DirEntry},
 };
 use ratatui::{
@@ -424,7 +424,7 @@ struct ShellApp {
 	menu_state: ListState,
 	status_line: String,
 	mode: Mode,
-	peer: PuppyPeer,
+	peer: PuppyNet,
 	last_refresh: Instant,
 	refresh_interval: Duration,
 	refresh_count: u64,
@@ -447,7 +447,7 @@ impl ShellApp {
 			menu_state: state,
 			status_line: "Use ↑/↓ to navigate, Enter to select, q to quit".to_string(),
 			mode: Mode::Menu,
-			peer: PuppyPeer::new(),
+			peer: PuppyNet::new(),
 			last_refresh: Instant::now(),
 			refresh_interval: Duration::from_secs(5),
 			refresh_count: 0,

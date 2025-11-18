@@ -1,11 +1,10 @@
 use args::Command;
 use clap::Parser;
-use puppypeer_core::PuppyPeer;
+use puppynet_core::PuppyNet;
 
 mod args;
 mod gui;
 mod installer;
-mod service;
 mod shell;
 mod types;
 mod updater;
@@ -74,7 +73,7 @@ async fn main() {
 			return;
 		}
 		None => {
-			let peer = PuppyPeer::new();
+			let peer = PuppyNet::new();
 			for path in &args.read {
 				if let Err(err) = peer.share_read_only_folder(path) {
 					log::error!("failed to share {} for read: {err:?}", path);

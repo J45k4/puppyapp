@@ -29,7 +29,7 @@ use uuid::Uuid;
 use crate::types::FileChunk;
 use crate::wait_group::WaitGroupGuard;
 
-const PUPPYPEER_PROTOCOL: &str = "/puppypeer/0.0.1";
+const PUPPYPEER_PROTOCOL: &str = "/puppynet/0.0.1";
 const MAX_FILE_CHUNK: u64 = 4 * 1024 * 1024; // 4 MiB per transfer chunk
 const OWNER_ROLE: &str = "owner";
 const VIEWER_ROLE: &str = "viewer";

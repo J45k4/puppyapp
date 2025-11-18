@@ -1,5 +1,5 @@
 [package]
-name = "puppypeer"
+name = "puppynet"
 version = "0.1.0"
 edition = "2024"
 
@@ -11,9 +11,8 @@ tokio = { version = "1", features = ["full"] }
 simple_logger = "5"
 ratatui = "0.27"
 crossterm = "0.27"
-puppypeer_core = { path = "../core" }
+puppynet_core = { path = "../core" }
 iced = { version = "0.12", features = ["tokio", "image"] }
-# Optional dependencies gated by features
 sha2 = { version = "0.10", features = ["oid"], optional = true }
 rsa = { version = "0.9", default-features = false, features = ["sha2", "pem"], optional = true }
 ring = { version = "0.17", optional = true }
@@ -41,7 +40,7 @@ default = [
 	"rusqlite",
 	"libp2p",
 	"uuid",
-	"puppypeer_core/sha2"
+	"puppynet_core/sha2"
 ]
 sha2 = ["dep:sha2"]
 rsa = ["dep:rsa", "sha2"]
@@ -54,5 +53,5 @@ service-manager = ["dep:service-manager"]
 rusqlite = ["dep:rusqlite"]
 libp2p = ["dep:libp2p"]
 uuid = ["dep:uuid"]
-ring = ["dep:ring", "puppypeer_core/ring"]
-rayon = ["dep:rayon", "puppypeer_core/rayon"]
+ring = ["dep:ring", "puppynet_core/ring"]
+rayon = ["dep:rayon", "puppynet_core/rayon"]

@@ -15,11 +15,12 @@ use iced::widget::{
 };
 use iced::{Application, Command, Element, Length, Settings, Subscription, Theme};
 use libp2p::PeerId;
-use puppypeer_core::p2p::{CpuInfo, DirEntry, DiskInfo};
-use puppypeer_core::scan::{self, ScanProgress};
-use puppypeer_core::{
-	FLAG_READ, FLAG_SEARCH, FLAG_WRITE, FileChunk, FolderRule, Permission, PuppyPeer, Rule, State,
+use puppynet_core::p2p::{CpuInfo, DirEntry, DiskInfo};
+use puppynet_core::scan::{self, ScanProgress};
+use puppynet_core::{
+	FLAG_READ, FLAG_SEARCH, FLAG_WRITE, FileChunk, FolderRule, Permission, PuppyNet, Rule, State,
 };
+use rusqlite::params;
 use tokio::task;
 
 const LOCAL_LISTEN_MULTIADDR: &str = "/ip4/0.0.0.0:8336";
@@ -32,17 +33,15 @@ pub enum MenuItem {
 	PeersGraph,
 	CreateUser,
 	FileSearch,
-	Scan,
 	ScanResults,
 	Quit,
 }
 
-const MENU_ITEMS: [MenuItem; 7] = [
+const MENU_ITEMS: [MenuItem; 6] = [
 	MenuItem::Peers,
 	MenuItem::PeersGraph,
 	MenuItem::CreateUser,
 	MenuItem::FileSearch,
-	MenuItem::Scan,
 	MenuItem::ScanResults,
 	MenuItem::Quit,
 ];
@@ -54,7 +53,6 @@ impl MenuItem {
 			MenuItem::PeersGraph => "Peers Graph",
 			MenuItem::CreateUser => "Create User",
 			MenuItem::FileSearch => "File Search",
-			MenuItem::Scan => "Scanning",
 			MenuItem::ScanResults => "Scan Results",
 			MenuItem::Quit => "Quit",
 		}
@@ -438,7 +436,7 @@ fn map_result<T>(result: anyhow::Result<T, anyhow::Error>) -> Result<T, String> 
 }
 
 async fn list_dir(
-	peer: Arc<PuppyPeer>,
+	peer: Arc<PuppyNet>,
 	peer_id: String,
 	path: String,
 ) -> (String, String, Result<Vec<DirEntry>, String>) {
@@ -448,7 +446,7 @@ async fn list_dir(
 }
 
 async fn list_permissions(
-	peer: Arc<PuppyPeer>,
+	peer: Arc<PuppyNet>,
 	peer_id: String,
 ) -> (String, Result<Vec<Permission>, String>) {
 	let target = PeerId::from_str(&peer_id).unwrap();
@@ -457,7 +455,7 @@ async fn list_permissions(
 }
 
 async fn list_granted_permissions(
-	peer: Arc<PuppyPeer>,
+	peer: Arc<PuppyNet>,
 	peer_id: String,
 ) -> (String, Result<Vec<Permission>, String>) {
 	let target = PeerId::from_str(&peer_id).unwrap();
@@ -466,7 +464,7 @@ async fn list_granted_permissions(
 }
 
 async fn list_disks(
-	peer: Arc<PuppyPeer>,
+	peer: Arc<PuppyNet>,
 	peer_id: String,
 ) -> (String, Result<Vec<DiskInfo>, String>) {
 	let target = PeerId::from_str(&peer_id).unwrap();
@@ -475,7 +473,7 @@ async fn list_disks(
 }
 
 async fn set_permissions(
-	peer: Arc<PuppyPeer>,
+	peer: Arc<PuppyNet>,
 	peer_id: String,
 	permissions: Vec<Permission>,
 ) -> (String, Result<Vec<Permission>, String>) {
@@ -485,7 +483,7 @@ async fn set_permissions(
 }
 
 async fn read_file(
-	peer: Arc<PuppyPeer>,
+	peer: Arc<PuppyNet>,
 	peer_id: String,
 	path: String,
 	offset: u64,
@@ -498,7 +496,7 @@ async fn read_file(
 }
 
 pub struct GuiApp {
-	peer: Arc<PuppyPeer>,
+	peer: Arc<PuppyNet>,
 	latest_state: Option<State>,
 	local_peer_id: Option<String>,
 	menu: MenuItem,
@@ -508,6 +506,7 @@ pub struct GuiApp {
 	graph: GraphView,
 	status: String,
 	app_title: String,
+	scan_state: ScanState,
 	active_scan: Option<ActiveScan>,
 	next_scan_id: u64,
 }
@@ -536,7 +535,6 @@ enum Mode {
 	PeersGraph,
 	CreateUser(CreateUserForm),
 	FileSearch(FileSearchState),
-	Scan(ScanState),
 	ScanResults(ScanResultsState),
 }
 
@@ -634,7 +632,7 @@ impl Application for GuiApp {
 	type Flags = String;
 
 	fn new(flags: Self::Flags) -> (Self, Command<Self::Message>) {
-		let peer = Arc::new(PuppyPeer::new());
+		let peer = Arc::new(PuppyNet::new());
 		let latest_state = peer.state().lock().ok().map(|state| state.clone());
 		let peers = latest_state
 			.as_ref()
@@ -653,6 +651,7 @@ impl Application for GuiApp {
 			graph,
 			status: String::from("Ready"),
 			app_title: flags,
+			scan_state: ScanState::new(),
 			active_scan: None,
 			next_scan_id: 1,
 		};
@@ -711,11 +710,6 @@ impl Application for GuiApp {
 						self.menu = item;
 						self.mode = Mode::FileSearch(FileSearchState::new());
 						self.status = String::from("File search");
-					}
-					MenuItem::Scan => {
-						self.menu = item;
-						self.mode = Mode::Scan(ScanState::new());
-						self.status = String::from("Folder scanning");
 					}
 					MenuItem::ScanResults => {
 						self.menu = item;
@@ -1348,41 +1342,34 @@ impl Application for GuiApp {
 				Command::none()
 			}
 			GuiMessage::ScanPathChanged(path) => {
-				if let Mode::Scan(state) = &mut self.mode {
-					state.path = path;
-				}
+				self.scan_state.path = path;
 				Command::none()
 			}
 			GuiMessage::ScanRequested => {
-				let (scan_id, receiver) = match &mut self.mode {
-					Mode::Scan(state) => {
-						if state.scanning {
-							return Command::none();
-						}
-						let requested = state.path.trim().to_string();
-						if requested.is_empty() {
-							state.error = Some(String::from("Scan path cannot be empty"));
-							return Command::none();
-						}
-						state.scanning = true;
-						state.error = None;
-						state.status = Some(format!("Scanning {}...", requested));
-						state.processed_files = 0;
-						state.total_files = 0;
-						self.status = format!("Scanning {}...", requested);
-						let scan_id = self.next_scan_id;
-						self.next_scan_id += 1;
-						let (tx, rx) = mpsc::channel();
-						let receiver = Arc::new(Mutex::new(rx));
-						self.active_scan = Some(ActiveScan {
-							id: scan_id,
-							receiver: receiver.clone(),
-						});
-						spawn_scan_worker(self.local_node_id_bytes(), requested.clone(), tx);
-						(scan_id, receiver)
-					}
-					_ => return Command::none(),
-				};
+				let state = &mut self.scan_state;
+				if state.scanning {
+					return Command::none();
+				}
+				let requested = state.path.trim().to_string();
+				if requested.is_empty() {
+					state.error = Some(String::from("Scan path cannot be empty"));
+					return Command::none();
+				}
+				state.scanning = true;
+				state.error = None;
+				state.status = Some(format!("Scanning {}...", requested));
+				state.processed_files = 0;
+				state.total_files = 0;
+				self.status = format!("Scanning {}...", requested);
+				let scan_id = self.next_scan_id;
+				self.next_scan_id += 1;
+				let (tx, rx) = mpsc::channel();
+				let receiver = Arc::new(Mutex::new(rx));
+				self.active_scan = Some(ActiveScan {
+					id: scan_id,
+					receiver: receiver.clone(),
+				});
+				spawn_scan_worker(self.local_node_id_bytes(), requested.clone(), tx);
 				Command::perform(wait_for_scan_event(receiver), move |event| {
 					GuiMessage::ScanEventReceived { id: scan_id, event }
 				})
@@ -1394,53 +1381,51 @@ impl Application for GuiApp {
 				let mut should_poll = false;
 				match event {
 					ScanEvent::Progress(progress) => {
-						if let Mode::Scan(state) = &mut self.mode {
-							state.total_files = progress.total_files;
-							state.processed_files = progress.processed_files;
-							let status = if progress.total_files > 0 {
-								format!(
-									"Scanning {}... {}/{} files ({} inserted, {} updated, {} removed)",
-									state.path,
-									progress.processed_files,
-									progress.total_files,
-									progress.inserted_count,
-									progress.updated_count,
-									progress.removed_count
-								)
-							} else {
-								format!("Scanning {}... collecting entries", state.path)
-							};
-							state.status = Some(status.clone());
-							state.error = None;
-							self.status = status;
-						}
+						let state = &mut self.scan_state;
+						state.total_files = progress.total_files;
+						state.processed_files = progress.processed_files;
+						let status = if progress.total_files > 0 {
+							format!(
+								"Scanning {}... {}/{} files ({} inserted, {} updated, {} removed)",
+								state.path,
+								progress.processed_files,
+								progress.total_files,
+								progress.inserted_count,
+								progress.updated_count,
+								progress.removed_count
+							)
+						} else {
+							format!("Scanning {}... collecting entries", state.path)
+						};
+						state.status = Some(status.clone());
+						state.error = None;
+						self.status = status;
 						should_poll = true;
 					}
 					ScanEvent::Finished(result) => {
-						if let Mode::Scan(state) = &mut self.mode {
-							state.scanning = false;
-							if state.total_files == 0 {
-								state.total_files = state.processed_files;
+						let state = &mut self.scan_state;
+						state.scanning = false;
+						if state.total_files == 0 {
+							state.total_files = state.processed_files;
+						}
+						match result {
+							Ok(stats) => {
+								let processed = state.processed_files;
+								let summary = format!(
+									"Scan finished: {} inserted, {} updated, {} removed after scanning {} files ({:.2}s)",
+									stats.inserted,
+									stats.updated,
+									stats.removed,
+									processed,
+									stats.duration_secs
+								);
+								state.status = Some(summary.clone());
+								state.error = None;
+								self.status = summary;
 							}
-							match result {
-								Ok(stats) => {
-									let processed = state.processed_files;
-									let summary = format!(
-										"Scan finished: {} inserted, {} updated, {} removed after scanning {} files ({:.2}s)",
-										stats.inserted,
-										stats.updated,
-										stats.removed,
-										processed,
-										stats.duration_secs
-									);
-									state.status = Some(summary.clone());
-									state.error = None;
-									self.status = summary;
-								}
-								Err(err) => {
-									state.error = Some(err.clone());
-									self.status = format!("Scan failed: {}", err);
-								}
+							Err(err) => {
+								state.error = Some(err.clone());
+								self.status = format!("Scan failed: {}", err);
 							}
 						}
 						self.active_scan = None;
@@ -1555,7 +1540,6 @@ impl Application for GuiApp {
 			Mode::PeersGraph => self.view_graph(),
 			Mode::CreateUser(form) => self.view_create_user(form),
 			Mode::FileSearch(state) => self.view_file_search(state),
-			Mode::Scan(state) => self.view_scan(state),
 			Mode::ScanResults(state) => self.view_scan_results(state),
 		};
 		let content_container = container(content)
@@ -1709,6 +1693,11 @@ impl GuiApp {
 				)
 				.push(button(text("Back")).on_press(GuiMessage::BackToPeers));
 			layout = layout.push(controls);
+			layout = layout.push(
+				container(self.view_scan_controls())
+					.padding(8)
+					.style(theme::Container::Box),
+			);
 			layout.into()
 		} else {
 			container(text("Selected peer not available").size(16))
@@ -2118,9 +2107,10 @@ impl GuiApp {
 		layout.push(scrollable(list).height(Length::Fill)).into()
 	}
 
-	fn view_scan(&self, state: &ScanState) -> Element<'_, GuiMessage> {
-		let mut layout = iced::widget::Column::new().spacing(12);
-		layout = layout.push(text("Folder Scanner").size(24));
+	fn view_scan_controls(&self) -> Element<'_, GuiMessage> {
+		let state = &self.scan_state;
+		let mut layout = iced::widget::Column::new().spacing(8);
+		layout = layout.push(text("Local Scan").size(20));
 		layout = layout
 			.push(text_input("Folder to scan", &state.path).on_input(GuiMessage::ScanPathChanged));
 		let mut controls = iced::widget::Row::new().spacing(12);
@@ -2525,7 +2515,7 @@ fn normalize_windows_drive(path: &str) -> String {
 }
 
 async fn fetch_cpus(
-	peer: Arc<PuppyPeer>,
+	peer: Arc<PuppyNet>,
 	peer_id: String,
 ) -> (String, Result<Vec<CpuInfo>, String>) {
 	let result = match PeerId::from_str(&peer_id) {
@@ -2568,7 +2558,7 @@ async fn wait_for_scan_event(receiver: Arc<Mutex<mpsc::Receiver<ScanEvent>>>) ->
 }
 
 async fn search_files(
-	_peer: Arc<PuppyPeer>,
+	_peer: Arc<PuppyNet>,
 	_query: String,
 	mime: Option<String>,
 	sort_desc: bool,
@@ -2600,7 +2590,7 @@ async fn load_scan_results_page(
 			)
 			.map_err(|err| format!("failed to prepare scan results query: {err}"))?;
 		let rows = stmt
-			.query_map((page_size as i64, offset as i64), |row| {
+			.query_map(params![page_size as i64, offset as i64], |row| {
 				let hash_bytes: Vec<u8> = row.get(0)?;
 				let hash = hash_bytes.iter().map(|b| format!("{:02x}", b)).collect();
 				let size: i64 = row.get(1)?;

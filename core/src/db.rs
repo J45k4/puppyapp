@@ -763,6 +763,6 @@ pub fn run_migrations(conn: &mut Connection) -> anyhow::Result<()> {
 }
 
 pub fn open_db() -> Connection {
-	let db_name = env::var("DB").unwrap_or_else(|_| String::from("puppyapp.db"));
+	let db_name = env::var("DB").unwrap_or_else(|_| String::from("puppynet.db"));
 	Connection::open(db_name).unwrap()
 }
