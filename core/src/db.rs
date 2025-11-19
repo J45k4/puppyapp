@@ -58,11 +58,6 @@ const MIGRATIONS: &[Migration] = &[
 				modified_at timestamp not null,
 				accessed_at timestamp not null
 			);
-			create table servers (
-				id integer primary key autoincrement,
-				port integer not null,
-				protocol integer not null
-			);
 			create table connections (
 				node_id BLOB not null,
 				url text not null,
