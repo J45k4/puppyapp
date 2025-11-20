@@ -56,20 +56,20 @@ jobs:
       - name: Build
         env:
           VERSION: ${{ github.ref_name }}
-        run: cargo build --release -p puppypeer
+        run: cargo build --release -p puppynet
 
       - name: Sign Binary (Windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
           $Env:PRIVATE_KEY | Out-File -FilePath private_key.pem -Encoding ASCII
-          openssl dgst -sha256 -sign private_key.pem -out target\release\puppypeer.sig target\release\puppypeer.exe
+          openssl dgst -sha256 -sign private_key.pem -out target\release\puppynet.sig target\release\puppynet.exe
           Remove-Item private_key.pem
       - name: Sign Binary (Unix)
         if: matrix.os != 'windows-latest'
         run: |
           echo "$PRIVATE_KEY" > private_key.pem
-          openssl dgst -sha256 -sign private_key.pem -out target/release/puppypeer.sig target/release/puppypeer
+          openssl dgst -sha256 -sign private_key.pem -out target/release/puppynet.sig target/release/puppynet
           rm private_key.pem
       - name: Package Binary (Windows)
         if: startsWith(github.ref, 'refs/tags/') && matrix.os == 'windows-latest'
@@ -78,10 +78,10 @@ jobs:
         env:
           TAG_NAME: ${{ github.ref_name }}
         run: |
-          $binaryName = "puppypeer.exe"
+          $binaryName = "puppynet.exe"
           $archiveVersion = $env:TAG_NAME -replace '/', '-'
           $archiveName = "${binaryName}-$archiveVersion-windows.zip"
-          Compress-Archive -Path "target\release\$binaryName","target\release\puppypeer.sig" -DestinationPath "$archiveName"
+          Compress-Archive -Path "target\release\$binaryName","target\release\puppynet.sig" -DestinationPath "$archiveName"
           echo "artifact_name=$archiveName" >> $env:GITHUB_OUTPUT
       - name: Package Binary (Unix)
         if: startsWith(github.ref, 'refs/tags/') && matrix.os != 'windows-latest'
@@ -94,11 +94,11 @@ jobs:
           else
             ARCHIVE_SUFFIX="linux.tar.gz"
           fi
-          BINARY_NAME="puppypeer"
+          BINARY_NAME="puppynet"
           TAG_SAFE="${TAG_NAME//\//-}"
           ARCHIVE_NAME="$BINARY_NAME-$TAG_SAFE-$ARCHIVE_SUFFIX"
-          # Include puppypeer and puppypeer.sig in the archive
-          tar -czf "$ARCHIVE_NAME" -C target/release "$BINARY_NAME" "puppypeer.sig"
+          # Include puppynet and puppynet.sig in the archive
+          tar -czf "$ARCHIVE_NAME" -C target/release "$BINARY_NAME" "puppynet.sig"
           echo "artifact_name=$ARCHIVE_NAME" >> $GITHUB_OUTPUT
       - name: Upload Artifact (Windows)
         if: startsWith(github.ref, 'refs/tags/') && matrix.os == 'windows-latest'
