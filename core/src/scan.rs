@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 #[cfg(feature = "rayon")]
 use rayon::prelude::*;
 use rusqlite::{Connection, ToSql};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::canonicalize;
 use std::io::{self, Read, Seek};
@@ -111,7 +111,7 @@ const UPDATE_FILE_LOCATION: &str = "UPDATE file_locations SET hash = ?, size = ?
 const DELETE_FILE_LOCATION: &str = "DELETE FROM file_locations WHERE node_id = ? and path = ?";
 const UPSERT_FILE_ENTRY: &str = "INSERT INTO file_entries (hash, size, mime_type, first_datetime, latest_datetime) VALUES (?, ?, ?, ?, ?) ON CONFLICT(hash) DO UPDATE SET latest_datetime = excluded.latest_datetime";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanResult {
 	pub updated_count: u64,
 	pub inserted_count: u64,
@@ -121,7 +121,7 @@ pub struct ScanResult {
 
 const PROGRESS_REPORT_INTERVAL: usize = 25;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ScanProgress {
 	pub total_files: usize,
 	pub processed_files: usize,
@@ -130,7 +130,7 @@ pub struct ScanProgress {
 	pub removed_count: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ScanEvent {
 	Progress(ScanProgress),
 	Finished(Result<ScanResult, String>),

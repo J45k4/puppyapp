@@ -27,6 +27,7 @@ use tokio::time::{Duration, interval};
 use uuid::Uuid;
 
 use crate::db::FileEntry;
+use crate::scan::{ScanEvent, ScanResult};
 use crate::types::FileChunk;
 use crate::wait_group::WaitGroupGuard;
 
@@ -57,9 +58,17 @@ pub enum PeerReq {
 	ListCpus,
 	ListDisks,
 	ListInterfaces,
+	StartScan {
+		id: u64,
+		path: String,
+	},
 	FileEntries {
 		offset: u64,
 		limit: u64,
+	},
+	ScanEvent {
+		id: u64,
+		event: ScanEvent,
 	},
 	Authenticate {
 		method: AuthMethod,
@@ -104,6 +113,8 @@ pub enum PeerRes {
 	Disks(Vec<DiskInfo>),
 	Interfaces(Vec<InterfaceInfo>),
 	FileEntries(Vec<FileEntry>),
+	ScanStarted(Result<(), String>),
+	ScanEventAck,
 	AuthSuccess {
 		session: SessionInfo,
 	},

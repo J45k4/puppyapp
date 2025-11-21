@@ -24,6 +24,7 @@ use std::{
 	env,
 	net::IpAddr,
 	path::{Path, PathBuf},
+	sync::atomic::{AtomicU64, Ordering},
 };
 use sysinfo::{Disks, Networks, System};
 use tokio::fs;
@@ -82,6 +83,11 @@ pub enum Command {
 	Scan {
 		path: String,
 		tx: mpsc::Sender<ScanEvent>,
+	},
+	RemoteScan {
+		peer: PeerId,
+		path: String,
+		scan_id: u64,
 	},
 }
 
@@ -158,9 +164,12 @@ pub struct App {
 	state: Arc<Mutex<State>>,
 	swarm: Swarm<AgentBehaviour>,
 	rx: UnboundedReceiver<Command>,
+	internal_rx: tokio::sync::mpsc::UnboundedReceiver<InternalCommand>,
+	internal_tx: tokio::sync::mpsc::UnboundedSender<InternalCommand>,
 	pending_requests: HashMap<OutboundRequestId, PendingRequest>,
 	system: System,
 	db: Arc<Mutex<SqliteConnection>>,
+	remote_scans: Arc<Mutex<HashMap<u64, mpsc::Sender<ScanEvent>>>>,
 }
 
 trait ResponseDecoder: Sized + Send + 'static {
@@ -245,6 +254,58 @@ impl<T: ResponseDecoder> Pending<T> {
 	}
 }
 
+struct PendingRemoteScanStart {
+	scan_id: u64,
+	channels: Arc<Mutex<HashMap<u64, mpsc::Sender<ScanEvent>>>>,
+}
+
+impl PendingRemoteScanStart {
+	fn new(
+		scan_id: u64,
+		channels: Arc<Mutex<HashMap<u64, mpsc::Sender<ScanEvent>>>>,
+	) -> PendingRequest {
+		Box::new(Self { scan_id, channels })
+	}
+}
+
+struct PendingScanEventAck;
+
+impl PendingScanEventAck {
+	fn new() -> PendingRequest {
+		Box::new(Self)
+	}
+}
+
+impl PendingResponseHandler for PendingScanEventAck {
+	fn complete(self: Box<Self>, _response: PeerRes) {}
+
+	fn fail(self: Box<Self>, error: anyhow::Error) {
+		log::warn!("scan event delivery failed: {}", error);
+	}
+}
+
+impl PendingResponseHandler for PendingRemoteScanStart {
+	fn complete(self: Box<Self>, response: PeerRes) {
+		match response {
+			PeerRes::ScanStarted(Ok(())) => {}
+			PeerRes::ScanStarted(Err(err)) => {
+				if let Some(tx) = self.channels.lock().unwrap().remove(&self.scan_id) {
+					let _ = tx.send(ScanEvent::Finished(Err(err)));
+				}
+			}
+			other => {
+				log::warn!("unexpected response for remote scan start {:?}", other);
+			}
+		}
+	}
+
+	fn fail(self: Box<Self>, error: anyhow::Error) {
+		if let Some(tx) = self.channels.lock().unwrap().remove(&self.scan_id) {
+			let _ = tx.send(ScanEvent::Finished(Err(error.to_string())));
+		}
+	}
+}
+
 impl<T: ResponseDecoder> PendingResponseHandler for Pending<T> {
 	fn complete(self: Box<Self>, response: PeerRes) {
 		let result = match response {
@@ -257,6 +318,14 @@ impl<T: ResponseDecoder> PendingResponseHandler for Pending<T> {
 	fn fail(self: Box<Self>, error: anyhow::Error) {
 		let _ = self.tx.send(Err(error));
 	}
+}
+
+enum InternalCommand {
+	SendScanEvent {
+		target: PeerId,
+		scan_id: u64,
+		event: ScanEvent,
+	},
 }
 
 type PendingRequest = Box<dyn PendingResponseHandler>;
@@ -272,6 +341,7 @@ impl App {
 	pub fn new(
 		state: Arc<Mutex<State>>,
 		db: Arc<Mutex<SqliteConnection>>,
+		remote_scans: Arc<Mutex<HashMap<u64, mpsc::Sender<ScanEvent>>>>,
 	) -> (Self, tokio::sync::mpsc::UnboundedSender<Command>) {
 		let key_path = env::var("KEYPAIR").unwrap_or_else(|_| String::from("peer_keypair.bin"));
 		let key_path = Path::new(&key_path);
@@ -302,6 +372,7 @@ impl App {
 			}
 		};
 		let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+		let (internal_tx, internal_rx) = tokio::sync::mpsc::unbounded_channel();
 
 		let listen_addr = "/ip4/0.0.0.0/tcp/0".parse().unwrap();
 		if let Err(err) = swarm.listen_on(listen_addr) {
@@ -320,9 +391,12 @@ impl App {
 				state,
 				swarm,
 				rx,
+				internal_rx,
+				internal_tx,
 				pending_requests: HashMap::new(),
 				system: System::new(),
 				db,
+				remote_scans,
 			},
 			tx,
 		)
@@ -503,6 +577,85 @@ impl App {
 						PeerRes::Error(format!("failed to load file entries: {err}"))
 					}
 				}
+			}
+			PeerReq::StartScan { id, path } => {
+				let requested_path = PathBuf::from(&path);
+				let canonical = match fs::canonicalize(&requested_path).await {
+					Ok(path) => path,
+					Err(err) => {
+						log::warn!("failed to canonicalize scan path {}: {err}", path);
+						return Ok(PeerRes::ScanStarted(Err(format!(
+							"failed to access path: {err}"
+						))));
+					}
+				};
+				if !self.can_access(peer, &canonical, FLAG_READ | FLAG_SEARCH) {
+					return Ok(PeerRes::ScanStarted(Err(String::from("Access denied"))));
+				}
+				let node_id = match self.local_node_id() {
+					Some(id) => id,
+					None => {
+						return Ok(PeerRes::ScanStarted(Err(String::from(
+							"failed to determine node id",
+						))));
+					}
+				};
+				let db = Arc::clone(&self.db);
+				let internal_tx = self.internal_tx.clone();
+				let path_string = canonical.to_string_lossy().to_string();
+				let target = peer;
+				tokio::spawn(async move {
+					let (progress_tx, mut progress_rx) =
+						tokio::sync::mpsc::unbounded_channel::<ScanEvent>();
+					let forward = tokio::spawn({
+						let internal_tx = internal_tx.clone();
+						async move {
+							while let Some(event) = progress_rx.recv().await {
+								let _ = internal_tx.send(InternalCommand::SendScanEvent {
+									target,
+									scan_id: id,
+									event,
+								});
+							}
+						}
+					});
+					let _ = tokio::task::spawn_blocking(move || {
+						let result = db
+							.lock()
+							.map_err(|err| format!("db lock poisoned: {err}"))
+							.and_then(|mut conn| {
+								scan::scan_with_progress(
+									&node_id,
+									&path_string,
+									&mut *conn,
+									|progress| {
+										let _ =
+											progress_tx.send(ScanEvent::Progress(progress.clone()));
+									},
+								)
+							});
+						let final_event = match result {
+							Ok(stats) => ScanEvent::Finished(Ok(stats)),
+							Err(err) => ScanEvent::Finished(Err(err)),
+						};
+						let _ = progress_tx.send(final_event);
+					})
+					.await;
+					let _ = forward.await;
+				});
+				PeerRes::ScanStarted(Ok(()))
+			}
+			PeerReq::ScanEvent { id, event } => {
+				let mut map = self.remote_scans.lock().unwrap();
+				if let Some(tx) = map.get(&id) {
+					let _ = tx.send(event.clone());
+					if matches!(event, ScanEvent::Finished(_)) {
+						map.remove(&id);
+					}
+				} else {
+					log::warn!("received scan event for unknown id {}", id);
+				}
+				PeerRes::ScanEventAck
 			}
 			PeerReq::ListPermissions => {
 				log::info!("[{}] ListPermissions", peer);
@@ -1126,6 +1279,21 @@ impl App {
 					let _ = tx.send(final_event);
 				});
 			}
+			Command::RemoteScan {
+				peer,
+				path,
+				scan_id,
+			} => {
+				let request_id = self
+					.swarm
+					.behaviour_mut()
+					.puppypeer
+					.send_request(&peer, PeerReq::StartScan { id: scan_id, path });
+				self.pending_requests.insert(
+					request_id,
+					PendingRemoteScanStart::new(scan_id, Arc::clone(&self.remote_scans)),
+				);
+			}
 		}
 	}
 
@@ -1138,6 +1306,29 @@ impl App {
 				if let Some(cmd) = cmd {
 					self.handle_cmd(cmd).await;
 				}
+			}
+			internal = self.internal_rx.recv() => {
+				if let Some(cmd) = internal {
+					self.handle_internal_cmd(cmd);
+				}
+			}
+		}
+	}
+
+	fn handle_internal_cmd(&mut self, cmd: InternalCommand) {
+		match cmd {
+			InternalCommand::SendScanEvent {
+				target,
+				scan_id,
+				event,
+			} => {
+				let request_id = self
+					.swarm
+					.behaviour_mut()
+					.puppypeer
+					.send_request(&target, PeerReq::ScanEvent { id: scan_id, event });
+				self.pending_requests
+					.insert(request_id, PendingScanEventAck::new());
 			}
 		}
 	}
@@ -1207,6 +1398,8 @@ pub struct PuppyNet {
 	state: Arc<Mutex<State>>,
 	cmd_tx: UnboundedSender<Command>,
 	db: Arc<Mutex<SqliteConnection>>,
+	remote_scans: Arc<Mutex<HashMap<u64, mpsc::Sender<ScanEvent>>>>,
+	remote_scan_counter: AtomicU64,
 }
 
 impl PuppyNet {
@@ -1222,7 +1415,8 @@ impl PuppyNet {
 		// channel to request shutdown
 		let (shutdown_tx, shutdown_rx) = oneshot::channel();
 		let state_clone = state.clone();
-		let (mut app, cmd_tx) = App::new(state_clone, db.clone());
+		let remote_scans = Arc::new(Mutex::new(HashMap::new()));
+		let (mut app, cmd_tx) = App::new(state_clone, db.clone(), remote_scans.clone());
 		let mut shutdown_rx = shutdown_rx;
 		let handle: JoinHandle<()> = tokio::spawn(async move {
 			loop {
@@ -1242,6 +1436,8 @@ impl PuppyNet {
 			state,
 			cmd_tx,
 			db,
+			remote_scans,
+			remote_scan_counter: AtomicU64::new(1),
 		}
 	}
 
@@ -1338,6 +1534,48 @@ impl PuppyNet {
 
 	pub fn list_interfaces_blocking(&self, peer_id: PeerId) -> Result<Vec<InterfaceInfo>> {
 		block_on(self.list_interfaces(peer_id))
+	}
+
+	pub fn scan_remote_peer(
+		&self,
+		peer: PeerId,
+		path: impl Into<String>,
+	) -> Result<Arc<Mutex<mpsc::Receiver<ScanEvent>>>, String> {
+		let path = path.into();
+		{
+			let state = self
+				.state
+				.lock()
+				.map_err(|_| String::from("state lock poisoned"))?;
+			if state.me == peer {
+				return self.scan_folder(path);
+			}
+		}
+		let (tx, rx) = mpsc::channel();
+		let scan_id = self.remote_scan_counter.fetch_add(1, Ordering::SeqCst);
+		self.remote_scans
+			.lock()
+			.unwrap()
+			.insert(scan_id, tx.clone());
+		self.cmd_tx
+			.send(Command::RemoteScan {
+				peer,
+				path,
+				scan_id,
+			})
+			.map_err(|e| {
+				self.remote_scans.lock().unwrap().remove(&scan_id);
+				format!("failed to send RemoteScan command: {e}")
+			})?;
+		Ok(Arc::new(Mutex::new(rx)))
+	}
+
+	pub fn scan_remote_peer_blocking(
+		&self,
+		peer: PeerId,
+		path: impl Into<String>,
+	) -> Result<Arc<Mutex<mpsc::Receiver<ScanEvent>>>, String> {
+		self.scan_remote_peer(peer, path)
 	}
 
 	pub async fn list_file_entries(
