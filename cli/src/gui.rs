@@ -2454,25 +2454,21 @@ impl GuiApp {
 		let mut layout = iced::widget::Column::new().spacing(12);
 		layout = layout.push(text("Storage Usage").size(24));
 		if state.loading {
-			return scrollable(
-				layout.push(text("Loading storage usage...").size(16))
-			)
-			.height(Length::Fill)
-			.into();
+			return scrollable(layout.push(text("Loading storage usage...").size(16)))
+				.height(Length::Fill)
+				.into();
 		}
 		if let Some(err) = &state.error {
 			return scrollable(
-				layout.push(text(format!("Failed to load storage usage: {}", err)).size(16))
+				layout.push(text(format!("Failed to load storage usage: {}", err)).size(16)),
 			)
 			.height(Length::Fill)
 			.into();
 		}
 		if state.nodes.is_empty() {
-			return scrollable(
-				layout.push(text("No storage data available.").size(16))
-			)
-			.height(Length::Fill)
-			.into();
+			return scrollable(layout.push(text("No storage data available.").size(16)))
+				.height(Length::Fill)
+				.into();
 		}
 		layout = layout.push(self.storage_header_row());
 		for (index, node) in state.nodes.iter().enumerate() {

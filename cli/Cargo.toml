@@ -40,8 +40,7 @@ default = [
 	"service-manager",
 	"rusqlite",
 	"libp2p",
-	"uuid",
-	"puppynet_core/sha2"
+	"uuid"
 ]
 sha2 = ["dep:sha2"]
 rsa = ["dep:rsa", "sha2"]
@@ -54,5 +53,4 @@ service-manager = ["dep:service-manager"]
 rusqlite = ["dep:rusqlite"]
 libp2p = ["dep:libp2p"]
 uuid = ["dep:uuid"]
-ring = ["dep:ring", "puppynet_core/ring"]
 rayon = ["dep:rayon", "puppynet_core/rayon"]

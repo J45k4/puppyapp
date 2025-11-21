@@ -26,8 +26,6 @@ async fn main() {
 
 	#[cfg(feature = "rayon")]
 	log::info!("rayon enabled");
-	#[cfg(feature = "ring")]
-	log::info!("ring enabled");
 
 	match &args.command {
 		Some(Command::Copy { src, dest }) => {

@@ -37,29 +37,9 @@ impl PartialEq for FileLocation {
 	}
 }
 
-#[cfg(feature = "ring")]
-fn sha256_hash<R: Read>(mut reader: R) -> io::Result<[u8; 32]> {
-	let mut context = ring::digest::Context::new(&ring::digest::SHA256);
-	let mut buffer = [0u8; 4096];
-	loop {
-		let count = reader.read(&mut buffer)?;
-		if count == 0 {
-			break;
-		}
-		context.update(&buffer[..count]);
-	}
-	// Finalize the hash and copy it into a fixed-size array.
-	let digest: ring::digest::Digest = context.finish();
-	let mut hash = [0u8; 32];
-	hash.copy_from_slice(digest.as_ref());
-	Ok(hash)
-}
-
-#[cfg(all(not(feature = "ring"), feature = "sha2"))]
-fn sha256_hash<R: Read>(mut reader: R) -> io::Result<[u8; 32]> {
-	use sha2::Digest;
-	let mut hasher = sha2::Sha256::new();
-	let mut buffer = [0u8; 4096];
+fn hash_file<R: Read>(mut reader: R) -> io::Result<[u8; 32]> {
+	let mut hasher = blake3::Hasher::new();
+	let mut buffer = [0u8; 8192];
 	loop {
 		let count = reader.read(&mut buffer)?;
 		if count == 0 {
@@ -67,7 +47,9 @@ fn sha256_hash<R: Read>(mut reader: R) -> io::Result<[u8; 32]> {
 		}
 		hasher.update(&buffer[..count]);
 	}
-	Ok(hasher.finalize().into())
+	let mut hash = [0u8; 32];
+	hash.copy_from_slice(hasher.finalize().as_bytes());
+	Ok(hash)
 }
 
 fn to_datetime(m: std::io::Result<std::time::SystemTime>) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -93,7 +75,7 @@ fn handle_path<P: AsRef<Path>>(path: P) -> FileLocation {
 		Err(_) => None,
 	};
 	file.seek(std::io::SeekFrom::Start(0)).unwrap();
-	let hash = sha256_hash(file).unwrap();
+	let hash = hash_file(file).unwrap();
 	FileLocation {
 		path: full_path,
 		hash: Some(hash),

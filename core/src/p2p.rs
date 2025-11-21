@@ -1,4 +1,5 @@
 use anyhow::Result;
+use blake3::Hasher;
 use chrono::{DateTime, Utc};
 use libp2p::identity::Keypair;
 use libp2p::multiaddr::Protocol;
@@ -13,7 +14,6 @@ use libp2p::{
 };
 use libp2p::{mdns, ping};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -469,15 +469,10 @@ fn now_timestamp() -> u64 {
 }
 
 fn hash_password(salt: &str, password: &str) -> String {
-	let mut hasher = Sha256::new();
+	let mut hasher = Hasher::new();
 	hasher.update(salt.as_bytes());
 	hasher.update(password.as_bytes());
-	let digest = hasher.finalize();
-	let mut output = String::with_capacity(digest.len() * 2);
-	for byte in digest {
-		output.push_str(&format!("{:02x}", byte));
-	}
-	output
+	hasher.finalize().to_hex().to_string()
 }
 
 fn verify_password(salt: &str, password: &str, expected_hash: &str) -> bool {
