@@ -939,7 +939,7 @@ impl App {
 			AgentEvent::Ping(event) => {
 				log::info!("Ping event: {:?}", event);
 			}
-			AgentEvent::PuppyPeer(event) => {
+			AgentEvent::PuppyNet(event) => {
 				match event {
 					libp2p::request_response::Event::Message {
 						peer,
@@ -956,15 +956,14 @@ impl App {
 									let _ = self
 										.swarm
 										.behaviour_mut()
-										.puppypeer
+										.puppynet
 										.send_response(channel, res);
 								} else {
-									let _ = self.swarm.behaviour_mut().puppypeer.send_response(
+									let _ = self.swarm.behaviour_mut().puppynet.send_response(
 										channel,
 										PeerRes::Error("Internal error".into()),
 									);
 								}
-								// self.swarm.behaviour_mut().puppypeer.send_response(channel, PuppyPeerResponse::)
 							}
 							libp2p::request_response::Message::Response {
 								request_id,
@@ -1132,7 +1131,7 @@ impl App {
 				let request_id = self
 					.swarm
 					.behaviour_mut()
-					.puppypeer
+					.puppynet
 					.send_request(&peer, PeerReq::ListDir { path: path.clone() });
 				if let Some(prev) = self
 					.pending_requests
@@ -1150,7 +1149,7 @@ impl App {
 				let request_id = self
 					.swarm
 					.behaviour_mut()
-					.puppypeer
+					.puppynet
 					.send_request(&peer_id, PeerReq::ListCpus);
 				self.pending_requests
 					.insert(request_id, Pending::<Vec<CpuInfo>>::new(tx));
@@ -1164,7 +1163,7 @@ impl App {
 				let request_id = self
 					.swarm
 					.behaviour_mut()
-					.puppypeer
+					.puppynet
 					.send_request(&peer_id, PeerReq::ListDisks);
 				self.pending_requests
 					.insert(request_id, Pending::<Vec<DiskInfo>>::new(tx));
@@ -1178,7 +1177,7 @@ impl App {
 				let request_id = self
 					.swarm
 					.behaviour_mut()
-					.puppypeer
+					.puppynet
 					.send_request(&peer_id, PeerReq::ListInterfaces);
 				self.pending_requests
 					.insert(request_id, Pending::<Vec<InterfaceInfo>>::new(tx));
@@ -1199,7 +1198,7 @@ impl App {
 				let request_id = self
 					.swarm
 					.behaviour_mut()
-					.puppypeer
+					.puppynet
 					.send_request(&peer, PeerReq::FileEntries { offset, limit });
 				self.pending_requests
 					.insert(request_id, Pending::<Vec<FileEntry>>::new(tx));
@@ -1225,7 +1224,7 @@ impl App {
 				let request_id = self
 					.swarm
 					.behaviour_mut()
-					.puppypeer
+					.puppynet
 					.send_request(&peer, PeerReq::ListPermissions);
 				if let Some(prev) = self
 					.pending_requests
@@ -1240,7 +1239,7 @@ impl App {
 					let _ = req.tx.send(chunk);
 					return;
 				}
-				let request_id = self.swarm.behaviour_mut().puppypeer.send_request(
+				let request_id = self.swarm.behaviour_mut().puppynet.send_request(
 					&req.peer_id,
 					PeerReq::ReadFile {
 						path: req.path.clone(),
@@ -1287,7 +1286,7 @@ impl App {
 				let request_id = self
 					.swarm
 					.behaviour_mut()
-					.puppypeer
+					.puppynet
 					.send_request(&peer, PeerReq::StartScan { id: scan_id, path });
 				self.pending_requests.insert(
 					request_id,
@@ -1325,7 +1324,7 @@ impl App {
 				let request_id = self
 					.swarm
 					.behaviour_mut()
-					.puppypeer
+					.puppynet
 					.send_request(&target, PeerReq::ScanEvent { id: scan_id, event });
 				self.pending_requests
 					.insert(request_id, PendingScanEventAck::new());

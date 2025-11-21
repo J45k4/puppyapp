@@ -765,26 +765,6 @@ impl ShellApp {
 		Ok(PeerCpuView::new(peer_id, cpus))
 	}
 
-	// fn fetch_remote_cpus(peer: &PuppyPeer, peer_id: &str) -> Result<Vec<CpuInfo>> {
-	// 	let target =
-	// 		PeerId::from_str(peer_id).with_context(|| format!("invalid peer id {peer_id}"))?;
-	// 	peer.list_cpus_remote_blocking(target)
-	// 		.with_context(|| format!("listing CPUs on {}", peer_id))
-	// }
-
-	// fn sample_local_cpus(system: &mut System) -> Vec<CpuInfo> {
-	// 	system.refresh_cpu_usage();
-	// 	system
-	// 		.cpus()
-	// 		.iter()
-	// 		.map(|cpu| CpuInfo {
-	// 			name: cpu.name().to_string(),
-	// 			usage: cpu.cpu_usage(),
-	// 			frequency_hz: cpu.frequency(),
-	// 		})
-	// 		.collect()
-	// }
-
 	fn cpu_summary(view: &PeerCpuView) -> String {
 		view.selected_cpu()
 			.map(|cpu| {
@@ -819,7 +799,7 @@ impl ShellApp {
 					])
 					.split(main_area);
 
-				let header = Paragraph::new("PuppyPeer")
+				let header = Paragraph::new("PuppyNet")
 					.style(Style::default().fg(Color::Yellow))
 					.block(Block::default().borders(Borders::ALL).title("Header"));
 				f.render_widget(header, chunks[0]);

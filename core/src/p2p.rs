@@ -31,7 +31,7 @@ use crate::scan::{ScanEvent, ScanResult};
 use crate::types::FileChunk;
 use crate::wait_group::WaitGroupGuard;
 
-const PUPPYPEER_PROTOCOL: &str = "/puppynet/0.0.1";
+const PUPPYNET_PROTOCOL: &str = "/puppynet/0.0.1";
 const MAX_FILE_CHUNK: u64 = 4 * 1024 * 1024; // 4 MiB per transfer chunk
 const OWNER_ROLE: &str = "owner";
 const VIEWER_ROLE: &str = "viewer";
@@ -250,20 +250,20 @@ pub struct TokenInfo {
 	pub issued_by: String,
 }
 
-type PuppyPeerBehaviour = request_response::json::Behaviour<PeerReq, PeerRes>;
+type PuppyNetBehaviour = request_response::json::Behaviour<PeerReq, PeerRes>;
 
 #[derive(NetworkBehaviour)]
 #[behaviour(to_swarm = "AgentEvent", event_process = false)]
 pub struct AgentBehaviour {
 	ping: ping::Behaviour,
-	pub puppypeer: PuppyPeerBehaviour,
+	pub puppynet: PuppyNetBehaviour,
 	pub mdns: mdns::tokio::Behaviour,
 }
 
 #[derive(Debug)]
 pub enum AgentEvent {
 	Ping(ping::Event),
-	PuppyPeer(RequestResponseEvent<PeerReq, PeerRes>),
+	PuppyNet(RequestResponseEvent<PeerReq, PeerRes>),
 	Mdns(mdns::Event),
 }
 
@@ -275,7 +275,7 @@ impl From<ping::Event> for AgentEvent {
 
 impl From<RequestResponseEvent<PeerReq, PeerRes>> for AgentEvent {
 	fn from(event: RequestResponseEvent<PeerReq, PeerRes>) -> Self {
-		AgentEvent::PuppyPeer(event)
+		AgentEvent::PuppyNet(event)
 	}
 }
 
@@ -287,19 +287,19 @@ impl From<mdns::Event> for AgentEvent {
 
 impl AgentBehaviour {
 	fn new(local_peer_id: PeerId) -> Self {
-		let puppypeer_protocol = std::iter::once((
-			StreamProtocol::new(PUPPYPEER_PROTOCOL),
+		let puppynet_protocol = std::iter::once((
+			StreamProtocol::new(PUPPYNET_PROTOCOL),
 			ProtocolSupport::Full,
 		));
-		let puppypeer = request_response::json::Behaviour::new(
-			puppypeer_protocol,
+		let puppynet: request_response::Behaviour<request_response::json::codec::Codec<PeerReq, PeerRes>> = request_response::json::Behaviour::new(
+			puppynet_protocol,
 			RequestResponseConfig::default(),
 		);
 		let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)
 			.expect("mDNS init failed");
 		Self {
 			ping: ping::Behaviour::default(),
-			puppypeer,
+			puppynet,
 			mdns,
 		}
 	}

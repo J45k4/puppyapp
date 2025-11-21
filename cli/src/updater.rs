@@ -36,7 +36,7 @@ fn get_os_name() -> String {
 }
 
 fn app_dir() -> PathBuf {
-	let path = homedir::my_home().unwrap().unwrap().join(".puppypeer");
+	let path = homedir::my_home().unwrap().unwrap().join(".puppynet");
 	if !path.exists() {
 		std::fs::create_dir_all(&path).unwrap();
 	}
@@ -55,14 +55,14 @@ async fn fetch_release(version: Option<&str>) -> anyhow::Result<Value> {
 	let client = reqwest::Client::new();
 	let url = match version {
 		Some(tag) => format!(
-			"https://api.github.com/repos/j45k4/puppypeer/releases/tags/{}",
+			"https://api.github.com/repos/j45k4/puppynet/releases/tags/{}",
 			tag
 		),
-		None => "https://api.github.com/repos/j45k4/puppypeer/releases/latest".to_string(),
+		None => "https://api.github.com/repos/j45k4/puppynet/releases/latest".to_string(),
 	};
 	let res = client
 		.get(url)
-		.header("User-Agent", "puppypeer")
+		.header("User-Agent", "puppynet")
 		.send()
 		.await?
 		.error_for_status()?;
@@ -163,12 +163,12 @@ pub async fn update(version: Option<&str>) -> anyhow::Result<()> {
 		log::info!("unpacking to {:?}", dst);
 		file.unpack(dst)?;
 	}
-	let bin_path = app_dir().join("puppypeer");
+	let bin_path = app_dir().join("puppynet");
 	let sig_path = bin_path.with_extension("sig");
 	if !verify_signature(&bin_path, &sig_path)? {
 		bail!("Signature verification failed");
 	}
-	tokio::fs::copy(&bin_path, bin_dir().join("puppypeer")).await?;
+	tokio::fs::copy(&bin_path, bin_dir().join("puppynet")).await?;
 	tokio::fs::remove_file(&bin_path).await?;
 	tokio::fs::remove_file(&sig_path).await?;
 	Ok(())

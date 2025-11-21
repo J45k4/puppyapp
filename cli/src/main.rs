@@ -61,7 +61,7 @@ async fn main() {
 			return;
 		}
 		Some(Command::Gui) => {
-			let app_title = format!("PuppyPeer v{}", version_label);
+			let app_title = format!("PuppyNet v{}", version_label);
 			if let Err(err) = gui::run(app_title) {
 				log::error!("gui error: {err:?}");
 				std::process::exit(1);

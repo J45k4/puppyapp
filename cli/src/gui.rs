@@ -2758,7 +2758,7 @@ mod tests {
 			.unwrap_or_default()
 			.as_nanos();
 		path.push(format!(
-			"puppypeer-test-{}-{}-{}.key",
+			"PuppyNet-test-{}-{}-{}.key",
 			test,
 			std::process::id(),
 			unique
