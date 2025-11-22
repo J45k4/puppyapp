@@ -206,27 +206,33 @@ where
 		// Detect archive format based on filename extension
 		if filename_clone.ends_with(".zip") {
 			// Extract ZIP archive (Windows)
+			// Flatten the archive - extract files directly to app_dir using only filename
 			log::info!("extracting ZIP archive");
 			let mut archive = ZipArchive::new(file)?;
 			for i in 0..archive.len() {
 				let mut entry = archive.by_index(i)?;
-				let name = match entry.enclosed_name() {
+				let full_path = match entry.enclosed_name() {
 					Some(name) => name.to_path_buf(),
 					None => continue,
 				};
-				log::info!("unpacking: {:?}", name);
-				let dst = app_dir().join(&name);
+
+				// Skip directories
+				if entry.is_dir() {
+					continue;
+				}
+
+				// Use only the filename, not the full path (flatten the archive)
+				let file_name = match full_path.file_name() {
+					Some(name) => name,
+					None => continue,
+				};
+
+				log::info!("unpacking: {:?} (from {:?})", file_name, full_path);
+				let dst = app_dir().join(file_name);
 				log::info!("unpacking to {:?}", dst);
 
-				if entry.is_dir() {
-					std::fs::create_dir_all(&dst)?;
-				} else {
-					if let Some(parent) = dst.parent() {
-						std::fs::create_dir_all(parent)?;
-					}
-					let mut outfile = std::fs::File::create(&dst)?;
-					std::io::copy(&mut entry, &mut outfile)?;
-				}
+				let mut outfile = std::fs::File::create(&dst)?;
+				std::io::copy(&mut entry, &mut outfile)?;
 			}
 		} else {
 			// Extract tar.gz archive (Linux/macOS)
@@ -260,6 +266,23 @@ where
 	} else {
 		bin_path.with_extension("sig")
 	};
+
+	// Check that both files exist before verification
+	if !bin_path.exists() {
+		// List directory contents for debugging
+		let entries: Vec<_> = std::fs::read_dir(app_dir())
+			.map(|rd| rd.filter_map(|e| e.ok().map(|e| e.file_name())).collect())
+			.unwrap_or_default();
+		log::error!("Binary not found at {:?}, directory contains: {:?}", bin_path, entries);
+		let error = format!("Binary not found: {:?}. Directory contains: {:?}", bin_path, entries);
+		progress_callback(UpdateProgress::Failed { error: error.clone() });
+		bail!("{}", error);
+	}
+	if !sig_path.exists() {
+		let error = format!("Signature file not found: {:?}", sig_path);
+		progress_callback(UpdateProgress::Failed { error: error.clone() });
+		bail!("{}", error);
+	}
 
 	// Verify signature in blocking context
 	let bin_path_clone = bin_path.clone();
