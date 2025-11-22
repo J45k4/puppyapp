@@ -214,8 +214,14 @@ impl FileBrowserState {
 }
 
 #[derive(Debug, Clone)]
+enum FileViewerSource {
+	FileBrowser(FileBrowserState),
+	StorageUsage(StorageUsageState),
+}
+
+#[derive(Debug, Clone)]
 struct FileViewerState {
-	browser: FileBrowserState,
+	source: FileViewerSource,
 	peer_id: String,
 	path: String,
 	mime: Option<String>,
@@ -227,12 +233,26 @@ struct FileViewerState {
 }
 
 impl FileViewerState {
-	fn new(browser: FileBrowserState, peer_id: String, path: String, mime: Option<String>) -> Self {
+	fn from_browser(browser: FileBrowserState, peer_id: String, path: String, mime: Option<String>) -> Self {
 		Self {
 			peer_id,
 			path,
 			mime,
-			browser,
+			source: FileViewerSource::FileBrowser(browser),
+			data: Vec::new(),
+			offset: 0,
+			eof: false,
+			loading: true,
+			error: None,
+		}
+	}
+
+	fn from_storage(storage: StorageUsageState, peer_id: String, path: String) -> Self {
+		Self {
+			peer_id,
+			path,
+			mime: None,
+			source: FileViewerSource::StorageUsage(storage),
 			data: Vec::new(),
 			offset: 0,
 			eof: false,
@@ -682,6 +702,10 @@ pub enum GuiMessage {
 	StorageUsageToggleNode(usize),
 	StorageUsageToggleEntry {
 		node_index: usize,
+		path: String,
+	},
+	StorageUsageOpenFile {
+		node_id: String,
 		path: String,
 	},
 	InterfacesFieldEdited,
@@ -1202,7 +1226,7 @@ impl Application for GuiApp {
 							result,
 						},
 					);
-					self.mode = Mode::FileViewer(FileViewerState::new(
+					self.mode = Mode::FileViewer(FileViewerState::from_browser(
 						browser_snapshot,
 						peer_id,
 						target,
@@ -1349,9 +1373,16 @@ impl Application for GuiApp {
 			}
 			GuiMessage::FileViewerBack => {
 				if let Mode::FileViewer(state) = mem::replace(&mut self.mode, Mode::Peers) {
-					let browser = state.browser;
-					self.status = format!("Browsing {} on {}", browser.path, browser.peer_id);
-					self.mode = Mode::FileBrowser(browser);
+					match state.source {
+						FileViewerSource::FileBrowser(browser) => {
+							self.status = format!("Browsing {} on {}", browser.path, browser.peer_id);
+							self.mode = Mode::FileBrowser(browser);
+						}
+						FileViewerSource::StorageUsage(storage) => {
+							self.status = String::from("Storage usage");
+							self.mode = Mode::StorageUsage(storage);
+						}
+					}
 				}
 				Command::none()
 			}
@@ -1650,6 +1681,29 @@ impl Application for GuiApp {
 			}
 			GuiMessage::StorageUsageToggleEntry { node_index, path } => {
 				self.toggle_storage_entry(node_index, &path);
+				Command::none()
+			}
+			GuiMessage::StorageUsageOpenFile { node_id, path } => {
+				if let Mode::StorageUsage(state) = &self.mode {
+					let storage_snapshot = state.clone();
+					self.status = format!("Reading {}...", path);
+					let peer = self.peer.clone();
+					let command = Command::perform(
+						read_file(peer, node_id.clone(), path.clone(), 0),
+						|(peer_id, path, offset, result)| GuiMessage::FileReadLoaded {
+							peer_id,
+							path,
+							offset,
+							result,
+						},
+					);
+					self.mode = Mode::FileViewer(FileViewerState::from_storage(
+						storage_snapshot,
+						node_id,
+						path,
+					));
+					return command;
+				}
 				Command::none()
 			}
 			GuiMessage::InterfacesFieldEdited => Command::none(),
@@ -2532,7 +2586,7 @@ impl GuiApp {
 			.spacing(4)
 			.push(container(row).padding(6).style(theme::Container::Box));
 		if node.expanded {
-			column = column.push(self.render_storage_entries(&node.entries, index, 1));
+			column = column.push(self.render_storage_entries(&node.entries, &node.id, index, 1));
 		}
 		column.into()
 	}
@@ -2540,6 +2594,7 @@ impl GuiApp {
 	fn render_storage_entries(
 		&self,
 		entries: &[StorageEntryView],
+		node_id: &str,
 		node_index: usize,
 		depth: usize,
 	) -> Element<'_, GuiMessage> {
@@ -2558,6 +2613,18 @@ impl GuiApp {
 					})
 					.style(theme::Button::Text)
 					.into()
+			};
+			let open_element: Element<_> = if entry.children.is_empty() {
+				button(text("Open").size(12))
+					.on_press(GuiMessage::StorageUsageOpenFile {
+						node_id: node_id.to_string(),
+						path: entry.path.clone(),
+					})
+					.style(theme::Button::Secondary)
+					.padding([2, 8])
+					.into()
+			} else {
+				text("").into()
 			};
 			row = row
 				.push(toggle_element)
@@ -2585,11 +2652,13 @@ impl GuiApp {
 					text(entry.last_changed.clone())
 						.size(14)
 						.width(Length::FillPortion(2)),
-				);
+				)
+				.push(open_element);
 			column = column.push(container(row).padding(4).style(theme::Container::Box));
 			if entry.expanded && !entry.children.is_empty() {
 				column = column.push(self.render_storage_entries(
 					&entry.children,
+					node_id,
 					node_index,
 					depth + 1,
 				));
@@ -2996,10 +3065,31 @@ async fn load_storage_usage(peer: Arc<PuppyNet>) -> Result<Vec<StorageNodeView>,
 		.list_storage_files()
 		.await
 		.map_err(|err| err.to_string())?;
-	Ok(build_storage_nodes(files))
+	let known_peers: Vec<PeerId> = {
+		let state_arc = peer.state();
+		let state = state_arc.lock().map_err(|e| e.to_string())?;
+		let mut peers = vec![state.me];
+		peers.extend(state.connections.iter().map(|c| c.peer_id));
+		peers.extend(state.discovered_peers.iter().map(|d| d.peer_id));
+		peers
+	};
+	Ok(build_storage_nodes(files, &known_peers))
 }
 
-fn build_storage_nodes(files: Vec<StorageUsageFile>) -> Vec<StorageNodeView> {
+fn build_storage_nodes(files: Vec<StorageUsageFile>, known_peers: &[PeerId]) -> Vec<StorageNodeView> {
+	// Build a map from truncated node_id (first 16 bytes) to full PeerId
+	let peer_map: HashMap<Vec<u8>, PeerId> = known_peers
+		.iter()
+		.filter_map(|peer_id| {
+			let bytes = peer_id.to_bytes();
+			if bytes.len() >= 16 {
+				Some((bytes[..16].to_vec(), *peer_id))
+			} else {
+				None
+			}
+		})
+		.collect();
+
 	let mut grouped: HashMap<Vec<u8>, (String, Vec<FileRecord>)> = HashMap::new();
 	for file in files {
 		let entry = grouped
@@ -3013,15 +3103,16 @@ fn build_storage_nodes(files: Vec<StorageUsageFile>) -> Vec<StorageNodeView> {
 	}
 	let mut nodes: Vec<StorageNodeView> = grouped
 		.into_iter()
-		.map(|(node_id, (name, records))| {
+		.filter_map(|(node_id, (name, records))| {
+			let peer_id = peer_map.get(&node_id)?;
 			let (entries, total_size) = build_storage_tree(records);
-			StorageNodeView {
+			Some(StorageNodeView {
 				name,
-				id: bytes_to_hex(&node_id),
+				id: peer_id.to_string(),
 				total_size,
 				entries,
 				expanded: false,
-			}
+			})
 		})
 		.collect();
 	nodes.sort_by(|a, b| a.name.cmp(&b.name));
