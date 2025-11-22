@@ -262,13 +262,6 @@ where
 	let bin_name = if cfg!(windows) { "puppynet.exe" } else { "puppynet" };
 	let bin_path = app_dir().join(bin_name);
 
-	// Try multiple possible signature file names
-	let possible_sig_names = if cfg!(windows) {
-		vec!["puppynet.exe.sig", "puppynet.sig"]
-	} else {
-		vec!["puppynet.sig"]
-	};
-
 	// List directory contents for debugging
 	let entries: Vec<_> = std::fs::read_dir(app_dir())
 		.map(|rd| rd.filter_map(|e| e.ok().map(|e| e.file_name())).collect())
@@ -283,11 +276,20 @@ where
 		bail!("{}", error);
 	}
 
-	// Find the signature file
-	let sig_path = possible_sig_names
+	// Find the signature file - try known names first, then search for any .sig file
+	let known_sig_names = ["puppynet.sig", "puppynet.exe.sig"];
+	let sig_path = known_sig_names
 		.iter()
 		.map(|name| app_dir().join(name))
-		.find(|p| p.exists());
+		.find(|p| p.exists())
+		.or_else(|| {
+			// Fallback: search for any .sig file in app_dir
+			std::fs::read_dir(app_dir())
+				.ok()?
+				.filter_map(|e| e.ok())
+				.map(|e| e.path())
+				.find(|p| p.extension().is_some_and(|ext| ext == "sig"))
+		});
 
 	let sig_path = match sig_path {
 		Some(p) => {
@@ -296,8 +298,8 @@ where
 		}
 		None => {
 			let error = format!(
-				"Signature file not found. Tried: {:?}. Directory contains: {:?}",
-				possible_sig_names, entries
+				"Signature file not found. Tried: {:?}, also searched for any .sig file. Directory contains: {:?}",
+				known_sig_names, entries
 			);
 			progress_callback(UpdateProgress::Failed { error: error.clone() });
 			bail!("{}", error);
