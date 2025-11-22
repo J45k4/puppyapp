@@ -2177,6 +2177,7 @@ impl PuppyNet {
 
 	/// Request a remote peer to update itself.
 	/// Returns a receiver that will receive UpdateProgress events as the update proceeds.
+	/// If the target peer is the local peer, performs a local self-update instead.
 	pub fn update_remote_peer(
 		&self,
 		peer: PeerId,
@@ -2184,20 +2185,57 @@ impl PuppyNet {
 	) -> Result<Arc<Mutex<mpsc::Receiver<UpdateProgress>>>, String> {
 		let (tx, rx) = mpsc::channel();
 		let update_id = self.remote_update_counter.fetch_add(1, Ordering::SeqCst);
-		self.remote_updates
-			.lock()
-			.unwrap()
-			.insert(update_id, tx.clone());
-		self.cmd_tx
-			.send(Command::RemoteUpdate {
-				peer,
-				version,
-				update_id,
-			})
-			.map_err(|e| {
-				self.remote_updates.lock().unwrap().remove(&update_id);
-				format!("failed to send RemoteUpdate command: {e}")
-			})?;
+
+		// Check if the target peer is self - if so, perform a local update
+		let is_self = {
+			let state = self.state.lock().unwrap();
+			peer == state.me
+		};
+
+		if is_self {
+			// Perform local self-update
+			let tx_clone = tx.clone();
+			let version_clone = version.clone();
+			// Use current_version = 0 for core library (actual version comes from CLI build)
+			let current_version = 0u32;
+
+			std::thread::spawn(move || {
+				let rt = tokio::runtime::Runtime::new().unwrap();
+				rt.block_on(async move {
+					let result = updater::update_with_progress(
+						version_clone.as_deref(),
+						current_version,
+						move |progress| {
+							let _ = tx_clone.send(progress);
+						},
+					)
+					.await;
+
+					if let Err(e) = result {
+						let _ = tx.send(UpdateProgress::Failed {
+							error: e.to_string(),
+						});
+					}
+				});
+			});
+		} else {
+			// Remote update - send command to dial peer
+			self.remote_updates
+				.lock()
+				.unwrap()
+				.insert(update_id, tx.clone());
+			self.cmd_tx
+				.send(Command::RemoteUpdate {
+					peer,
+					version,
+					update_id,
+				})
+				.map_err(|e| {
+					self.remote_updates.lock().unwrap().remove(&update_id);
+					format!("failed to send RemoteUpdate command: {e}")
+				})?;
+		}
+
 		Ok(Arc::new(Mutex::new(rx)))
 	}
 
