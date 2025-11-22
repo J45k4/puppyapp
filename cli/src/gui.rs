@@ -251,31 +251,41 @@ struct FileViewerState {
 }
 
 impl FileViewerState {
+	fn guess_mime(path: &str) -> Option<String> {
+		mime_guess::from_path(path)
+			.first_raw()
+			.map(|s| s.to_string())
+	}
+
 	fn from_browser(browser: FileBrowserState, peer_id: String, path: String, mime: Option<String>) -> Self {
+		// Use provided mime, or guess from path
+		let detected_mime = mime.or_else(|| Self::guess_mime(&path));
 		Self {
 			peer_id,
-			path,
-			mime,
+			mime: detected_mime,
 			source: FileViewerSource::FileBrowser(browser),
 			data: Vec::new(),
 			offset: 0,
 			eof: false,
 			loading: true,
 			error: None,
+			path,
 		}
 	}
 
 	fn from_storage(storage: StorageUsageState, peer_id: String, path: String) -> Self {
+		// Guess mime from path for storage files
+		let detected_mime = Self::guess_mime(&path);
 		Self {
 			peer_id,
-			path,
-			mime: None,
+			mime: detected_mime,
 			source: FileViewerSource::StorageUsage(storage),
 			data: Vec::new(),
 			offset: 0,
 			eof: false,
 			loading: true,
 			error: None,
+			path,
 		}
 	}
 
