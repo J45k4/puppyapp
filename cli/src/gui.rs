@@ -437,6 +437,8 @@ struct FileSearchState {
 	total_count: usize,
 	// Scroll state
 	scroll_offset: scrollable::RelativeOffset,
+	// Thumbnails for grid view (key: "node_id:path")
+	thumbnails: HashMap<String, ThumbnailState>,
 }
 
 #[derive(Debug, Clone)]
@@ -532,7 +534,20 @@ impl FileSearchState {
 			page_size: 50,
 			total_count: 0,
 			scroll_offset: scrollable::RelativeOffset::START,
+			thumbnails: HashMap::new(),
 		}
+	}
+
+	fn thumbnail_key(node_id: &str, path: &str) -> String {
+		format!("{}:{}", node_id, path)
+	}
+
+	fn is_image_entry(entry: &FileSearchEntry) -> bool {
+		entry
+			.mime_type
+			.as_deref()
+			.map(|m| m.starts_with("image/"))
+			.unwrap_or(false)
 	}
 }
 
@@ -661,6 +676,19 @@ async fn fetch_thumbnail(
 		.get_thumbnail(target, path.clone(), THUMBNAIL_MAX_SIZE, THUMBNAIL_MAX_SIZE)
 		.await;
 	(path, map_result(result))
+}
+
+async fn fetch_files_page_thumbnail(
+	peer: Arc<PuppyNet>,
+	peer_id: String,
+	path: String,
+	key: String,
+) -> (String, Result<Thumbnail, String>) {
+	let target = PeerId::from_str(&peer_id).unwrap();
+	let result = peer
+		.get_thumbnail(target, path, THUMBNAIL_MAX_SIZE, THUMBNAIL_MAX_SIZE)
+		.await;
+	(key, map_result(result))
 }
 
 pub struct GuiApp {
@@ -826,6 +854,11 @@ pub enum GuiMessage {
 	InterfacesFieldEdited,
 	ThumbnailLoaded {
 		path: String,
+		result: Result<Thumbnail, String>,
+	},
+	/// Thumbnail loaded for files page (key: "node_id:path")
+	FilesPageThumbnailLoaded {
+		key: String,
 		result: Result<Thumbnail, String>,
 	},
 	/// Request to update a remote peer
@@ -1588,7 +1621,32 @@ impl Application for GuiApp {
 			}
 			GuiMessage::FilesViewModeChanged(mode) => {
 				if let Mode::FileSearch(state) = &mut self.mode {
+					let old_mode = state.view_mode;
 					state.view_mode = mode;
+					// When switching to Thumbnails mode, fetch thumbnails for existing results
+					if mode == FilesViewMode::Thumbnails && old_mode != FilesViewMode::Thumbnails && !state.results.is_empty() {
+						state.thumbnails.clear();
+						let mut thumbnail_commands = Vec::new();
+						for entry in &state.results {
+							if FileSearchState::is_image_entry(entry) {
+								let key = FileSearchState::thumbnail_key(&entry.node_id, &entry.path);
+								state.thumbnails.insert(key.clone(), ThumbnailState::Loading);
+								let peer = self.peer.clone();
+								thumbnail_commands.push(Command::perform(
+									fetch_files_page_thumbnail(
+										peer,
+										entry.node_id.clone(),
+										entry.path.clone(),
+										key,
+									),
+									|(key, result)| GuiMessage::FilesPageThumbnailLoaded { key, result },
+								));
+							}
+						}
+						if !thumbnail_commands.is_empty() {
+							return Command::batch(thumbnail_commands);
+						}
+					}
 				}
 				Command::none()
 			}
@@ -1657,14 +1715,38 @@ impl Application for GuiApp {
 			GuiMessage::FileSearchLoaded(result) => {
 				if let Mode::FileSearch(state) = &mut self.mode {
 					state.loading = false;
+					state.thumbnails.clear();
 					match result {
 						Ok((entries, mimes, total)) => {
+							// Collect thumbnail commands for image files when in Thumbnails mode
+							let mut thumbnail_commands = Vec::new();
+							if state.view_mode == FilesViewMode::Thumbnails {
+								for entry in &entries {
+									if FileSearchState::is_image_entry(entry) {
+										let key = FileSearchState::thumbnail_key(&entry.node_id, &entry.path);
+										state.thumbnails.insert(key.clone(), ThumbnailState::Loading);
+										let peer = self.peer.clone();
+										thumbnail_commands.push(Command::perform(
+											fetch_files_page_thumbnail(
+												peer,
+												entry.node_id.clone(),
+												entry.path.clone(),
+												key,
+											),
+											|(key, result)| GuiMessage::FilesPageThumbnailLoaded { key, result },
+										));
+									}
+								}
+							}
 							state.results = entries;
 							state.available_mime_types = mimes;
 							state.total_count = total;
 							let start = state.page * state.page_size + 1;
 							let end = (start + state.results.len()).saturating_sub(1);
 							self.status = format!("Showing {}-{} of {} files", start, end, total);
+							if !thumbnail_commands.is_empty() {
+								return Command::batch(thumbnail_commands);
+							}
 						}
 						Err(err) => {
 							state.error = Some(err.clone());
@@ -2015,6 +2097,19 @@ impl Application for GuiApp {
 						}
 						Err(_) => {
 							state.thumbnails.insert(path, ThumbnailState::Failed);
+						}
+					}
+				}
+				Command::none()
+			}
+			GuiMessage::FilesPageThumbnailLoaded { key, result } => {
+				if let Mode::FileSearch(state) = &mut self.mode {
+					match result {
+						Ok(thumb) => {
+							state.thumbnails.insert(key, ThumbnailState::Loaded(thumb.data));
+						}
+						Err(_) => {
+							state.thumbnails.insert(key, ThumbnailState::Failed);
 						}
 					}
 				}
@@ -2955,8 +3050,148 @@ impl GuiApp {
 				layout.into()
 			}
 			FilesViewMode::Thumbnails => {
-				// Placeholder for thumbnails view - will show a simple message for now
-				layout = layout.push(text("Thumbnails view coming soon...").size(16));
+				// Thumbnails grid view
+				if state.results.is_empty() {
+					layout = layout.push(text("No files found").size(16));
+				} else {
+					const ITEMS_PER_ROW: usize = 5;
+					const THUMBNAIL_SIZE: f32 = 128.0;
+					const ITEM_WIDTH: f32 = 150.0;
+					const ITEM_HEIGHT: f32 = 180.0;
+
+					let mut grid = iced::widget::Column::new().spacing(12);
+					let mut current_row = iced::widget::Row::new().spacing(12);
+					let mut items_in_row = 0;
+
+					for entry in &state.results {
+						let key = FileSearchState::thumbnail_key(&entry.node_id, &entry.path);
+						let is_image = FileSearchState::is_image_entry(entry);
+
+						// Create thumbnail or placeholder
+						let thumbnail_content: Element<'_, GuiMessage> = if is_image {
+							match state.thumbnails.get(&key) {
+								Some(ThumbnailState::Loaded(data)) => {
+									let handle = ImageHandle::from_memory(data.clone());
+									Image::new(handle)
+										.width(Length::Fixed(THUMBNAIL_SIZE))
+										.height(Length::Fixed(THUMBNAIL_SIZE))
+										.into()
+								}
+								Some(ThumbnailState::Loading) => {
+									container(text("...").size(14))
+										.width(Length::Fixed(THUMBNAIL_SIZE))
+										.height(Length::Fixed(THUMBNAIL_SIZE))
+										.align_x(Horizontal::Center)
+										.align_y(Vertical::Center)
+										.style(theme::Container::Box)
+										.into()
+								}
+								Some(ThumbnailState::Failed) | None => {
+									container(text("?").size(14))
+										.width(Length::Fixed(THUMBNAIL_SIZE))
+										.height(Length::Fixed(THUMBNAIL_SIZE))
+										.align_x(Horizontal::Center)
+										.align_y(Vertical::Center)
+										.style(theme::Container::Box)
+										.into()
+								}
+							}
+						} else {
+							// Non-image file placeholder showing mime type
+							let mime_label = entry.mime_type.clone().unwrap_or_else(|| "file".to_string());
+							let short_mime = mime_label.split('/').last().unwrap_or(&mime_label);
+							container(text(short_mime).size(12))
+								.width(Length::Fixed(THUMBNAIL_SIZE))
+								.height(Length::Fixed(THUMBNAIL_SIZE))
+								.align_x(Horizontal::Center)
+								.align_y(Vertical::Center)
+								.style(theme::Container::Box)
+								.into()
+						};
+
+						// Truncate filename for display
+						let display_name = if entry.name.len() > 18 {
+							format!("{}...", &entry.name[..15])
+						} else {
+							entry.name.clone()
+						};
+
+						// Build the item card
+						let item_column = iced::widget::Column::new()
+							.spacing(4)
+							.align_items(iced::Alignment::Center)
+							.push(thumbnail_content)
+							.push(text(&display_name).size(11))
+							.push(text(format_size(entry.size)).size(10));
+
+						let item_container = container(item_column)
+							.width(Length::Fixed(ITEM_WIDTH))
+							.height(Length::Fixed(ITEM_HEIGHT))
+							.padding(4)
+							.align_x(Horizontal::Center);
+
+						let item_button = button(item_container)
+							.padding(0)
+							.on_press(GuiMessage::FilesOpenFile {
+								node_id: entry.node_id.clone(),
+								path: entry.path.clone(),
+								mime: entry.mime_type.clone(),
+							});
+
+						current_row = current_row.push(item_button);
+						items_in_row += 1;
+
+						if items_in_row >= ITEMS_PER_ROW {
+							grid = grid.push(current_row);
+							current_row = iced::widget::Row::new().spacing(12);
+							items_in_row = 0;
+						}
+					}
+
+					// Add remaining items in the last row
+					if items_in_row > 0 {
+						grid = grid.push(current_row);
+					}
+
+					layout = layout.push(
+						scrollable(grid)
+							.height(Length::Fill)
+							.id(scrollable::Id::new("files_thumbnails_grid")),
+					);
+				}
+
+				// Pagination controls (same as table view)
+				let total_pages = (state.total_count + state.page_size - 1) / state.page_size.max(1);
+				let start = state.page * state.page_size + 1;
+				let end = (start + state.results.len()).saturating_sub(1);
+				let page_info = format!(
+					"Page {} of {} ({}-{} of {})",
+					state.page + 1,
+					total_pages,
+					if state.total_count == 0 { 0 } else { start },
+					end,
+					state.total_count
+				);
+
+				let mut prev_btn = button(text("Previous"));
+				if state.page > 0 {
+					prev_btn = prev_btn.on_press(GuiMessage::FilesPrevPage);
+				}
+
+				let mut next_btn = button(text("Next"));
+				let max_page = state.total_count.saturating_sub(1) / state.page_size.max(1);
+				if state.page < max_page && state.total_count > 0 {
+					next_btn = next_btn.on_press(GuiMessage::FilesNextPage);
+				}
+
+				let pagination_row = iced::widget::Row::new()
+					.spacing(12)
+					.align_items(iced::Alignment::Center)
+					.push(prev_btn)
+					.push(text(page_info).size(14))
+					.push(next_btn);
+				layout = layout.push(pagination_row);
+
 				layout.into()
 			}
 		}
