@@ -846,7 +846,12 @@ async fn read_file(
 	path: String,
 	offset: u64,
 ) -> (String, String, u64, Result<FileChunk, String>) {
-	let target = PeerId::from_str(&peer_id).unwrap();
+	let target = match PeerId::from_str(&peer_id) {
+		Ok(pid) => pid,
+		Err(err) => {
+			return (peer_id, path, offset, Err(format!("Invalid peer ID: {}", err)));
+		}
+	};
 	let result = peer
 		.read_file(target, path.clone(), offset, Some(FILE_VIEW_CHUNK_SIZE))
 		.await;
@@ -1866,21 +1871,42 @@ impl Application for GuiApp {
 				Command::none()
 			}
 			GuiMessage::FileViewerBack => {
-				// When going back from file viewer in a tab, close the tab
+				// When going back from file viewer in a tab, restore the source mode
 				if let Some(active_id) = self.active_tab_id {
-					if let Some(pos) = self.tabs.iter().position(|t| t.id == active_id) {
-						if let Mode::FileViewer(_) = &self.tabs[pos].mode {
-							// Close this tab
-							self.tabs.remove(pos);
-							// Switch to another tab or clear
-							if self.tabs.is_empty() {
-								self.active_tab_id = None;
-							} else {
-								let new_pos = pos.min(self.tabs.len().saturating_sub(1));
-								self.active_tab_id = self.tabs.get(new_pos).map(|t| t.id);
+					if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == active_id) {
+						if let Mode::FileViewer(viewer_state) = &tab.mode {
+							let source = viewer_state.source.clone();
+							match source {
+								FileViewerSource::FileBrowser(browser) => {
+									self.status = format!("Browsing {} on {}", browser.path, browser.peer_id);
+									tab.mode = Mode::FileBrowser(browser);
+									tab.update_title();
+									return Command::none();
+								}
+								FileViewerSource::StorageUsage(storage) => {
+									self.status = String::from("Storage usage");
+									tab.mode = Mode::StorageUsage(storage);
+									tab.menu = MenuItem::StorageUsage;
+									tab.update_title();
+									return Command::none();
+								}
+								FileViewerSource::Files(files) => {
+									self.status = String::from("Files");
+									let scroll_offset = files.scroll_offset;
+									let scroll_id = if files.view_mode == FilesViewMode::Thumbnails {
+										"files_thumbnails_grid"
+									} else {
+										"files_table"
+									};
+									tab.mode = Mode::FileSearch(files);
+									tab.menu = MenuItem::FileSearch;
+									tab.update_title();
+									return scrollable::snap_to(
+										scrollable::Id::new(scroll_id),
+										scroll_offset,
+									);
+								}
 							}
-							self.status = String::from("Tab closed");
-							return Command::none();
 						}
 					}
 				}
@@ -2423,17 +2449,35 @@ impl Application for GuiApp {
 				Command::none()
 			}
 			GuiMessage::StorageUsageLoaded(result) => {
+				// Update self.mode
 				if let Mode::StorageUsage(state) = &mut self.mode {
 					state.loading = false;
-					match result {
+					match &result {
 						Ok(nodes) => {
-							state.nodes = nodes;
+							state.nodes = nodes.clone();
 							state.error = None;
 							self.status = String::from("Storage usage loaded");
 						}
 						Err(err) => {
 							state.error = Some(err.clone());
 							self.status = format!("Failed to load storage usage: {}", err);
+						}
+					}
+				}
+				// Also update active tab's mode if it's StorageUsage
+				if let Some(active_id) = self.active_tab_id {
+					if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == active_id) {
+						if let Mode::StorageUsage(state) = &mut tab.mode {
+							state.loading = false;
+							match result {
+								Ok(nodes) => {
+									state.nodes = nodes;
+									state.error = None;
+								}
+								Err(err) => {
+									state.error = Some(err);
+								}
+							}
 						}
 					}
 				}
@@ -2448,8 +2492,25 @@ impl Application for GuiApp {
 				Command::none()
 			}
 			GuiMessage::StorageUsageOpenFile { node_id, path } => {
-				if let Mode::StorageUsage(state) = &self.mode {
-					let storage_snapshot = state.clone();
+				// Get storage state from active tab or self.mode
+				let storage_state = if let Some(active_id) = self.active_tab_id {
+					self.tabs
+						.iter()
+						.find(|t| t.id == active_id)
+						.and_then(|t| {
+							if let Mode::StorageUsage(state) = &t.mode {
+								Some(state.clone())
+							} else {
+								None
+							}
+						})
+				} else if let Mode::StorageUsage(state) = &self.mode {
+					Some(state.clone())
+				} else {
+					None
+				};
+
+				if let Some(storage_snapshot) = storage_state {
 					self.status = format!("Reading {}...", path);
 					let peer = self.peer.clone();
 					let command = Command::perform(
@@ -2461,11 +2522,19 @@ impl Application for GuiApp {
 							result,
 						},
 					);
-					self.mode = Mode::FileViewer(FileViewerState::from_storage(
+					let viewer_state = FileViewerState::from_storage(
 						storage_snapshot,
 						node_id,
 						path,
-					));
+					);
+					// Update both self.mode and active tab's mode
+					self.mode = Mode::FileViewer(viewer_state.clone());
+					if let Some(active_id) = self.active_tab_id {
+						if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == active_id) {
+							tab.mode = Mode::FileViewer(viewer_state);
+							tab.update_title();
+						}
+					}
 					return command;
 				}
 				Command::none()
@@ -3741,7 +3810,8 @@ impl GuiApp {
 					layout = layout.push(
 						scrollable(grid)
 							.height(Length::Fill)
-							.id(scrollable::Id::new("files_thumbnails_grid")),
+							.id(scrollable::Id::new("files_thumbnails_grid"))
+							.on_scroll(GuiMessage::FilesScrolled),
 					);
 				}
 
@@ -4073,17 +4143,39 @@ impl GuiApp {
 	}
 
 	fn toggle_storage_node(&mut self, index: usize) {
+		// Update self.mode
 		if let Mode::StorageUsage(state) = &mut self.mode {
 			if let Some(node) = state.nodes.get_mut(index) {
 				node.expanded = !node.expanded;
 			}
 		}
+		// Also update active tab's mode
+		if let Some(active_id) = self.active_tab_id {
+			if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == active_id) {
+				if let Mode::StorageUsage(state) = &mut tab.mode {
+					if let Some(node) = state.nodes.get_mut(index) {
+						node.expanded = !node.expanded;
+					}
+				}
+			}
+		}
 	}
 
 	fn toggle_storage_entry(&mut self, index: usize, path: &str) {
+		// Update self.mode
 		if let Mode::StorageUsage(state) = &mut self.mode {
 			if let Some(node) = state.nodes.get_mut(index) {
 				toggle_storage_entry_recursive(&mut node.entries, path);
+			}
+		}
+		// Also update active tab's mode
+		if let Some(active_id) = self.active_tab_id {
+			if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == active_id) {
+				if let Mode::StorageUsage(state) = &mut tab.mode {
+					if let Some(node) = state.nodes.get_mut(index) {
+						toggle_storage_entry_recursive(&mut node.entries, path);
+					}
+				}
 			}
 		}
 	}
@@ -4471,6 +4563,26 @@ async fn search_files(
 		page_size,
 	};
 
+	// Build a map from truncated node_id (first 16 bytes) to full PeerId
+	let peer_map: HashMap<Vec<u8>, PeerId> = {
+		let state_arc = peer.state();
+		let state = state_arc.lock().map_err(|e| e.to_string())?;
+		let mut peers = vec![state.me];
+		peers.extend(state.connections.iter().map(|c| c.peer_id));
+		peers.extend(state.discovered_peers.iter().map(|d| d.peer_id));
+		peers
+			.into_iter()
+			.filter_map(|peer_id| {
+				let bytes = peer_id.to_bytes();
+				if bytes.len() >= 16 {
+					Some((bytes[..16].to_vec(), peer_id))
+				} else {
+					None
+				}
+			})
+			.collect()
+	};
+
 	let (results, mimes, total) = task::spawn_blocking(move || peer.search_files(args))
 		.await
 		.map_err(|err| format!("search task failed: {err}"))??;
@@ -4479,7 +4591,11 @@ async fn search_files(
 		.into_iter()
 		.map(|row| {
 			let hash = row.hash.iter().map(|b| format!("{:02x}", b)).collect();
-			let node_id = row.node_id.iter().map(|b| format!("{:02x}", b)).collect();
+			// Convert truncated node_id bytes to full PeerId string (Base58)
+			let node_id = peer_map
+				.get(&row.node_id)
+				.map(|pid| pid.to_string())
+				.unwrap_or_else(|| row.node_id.iter().map(|b| format!("{:02x}", b)).collect());
 			FileSearchEntry {
 				hash,
 				name: row.name,
@@ -4574,16 +4690,20 @@ fn build_storage_nodes(files: Vec<StorageUsageFile>, known_peers: &[PeerId]) -> 
 	}
 	let mut nodes: Vec<StorageNodeView> = grouped
 		.into_iter()
-		.filter_map(|(node_id, (name, records))| {
-			let peer_id = peer_map.get(&node_id)?;
+		.map(|(node_id, (name, records))| {
+			// Try to find the full PeerId, otherwise use hex representation of node_id
+			let id = peer_map
+				.get(&node_id)
+				.map(|pid| pid.to_string())
+				.unwrap_or_else(|| node_id.iter().map(|b| format!("{:02x}", b)).collect());
 			let (entries, total_size) = build_storage_tree(records);
-			Some(StorageNodeView {
+			StorageNodeView {
 				name,
-				id: peer_id.to_string(),
+				id,
 				total_size,
 				entries,
 				expanded: false,
-			})
+			}
 		})
 		.collect();
 	nodes.sort_by(|a, b| a.name.cmp(&b.name));
