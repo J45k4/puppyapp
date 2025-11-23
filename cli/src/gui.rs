@@ -2471,8 +2471,25 @@ impl Application for GuiApp {
 				Command::none()
 			}
 			GuiMessage::StorageUsageOpenFile { node_id, path } => {
-				if let Mode::StorageUsage(state) = &self.mode {
-					let storage_snapshot = state.clone();
+				// Get storage state from active tab or self.mode
+				let storage_state = if let Some(active_id) = self.active_tab_id {
+					self.tabs
+						.iter()
+						.find(|t| t.id == active_id)
+						.and_then(|t| {
+							if let Mode::StorageUsage(state) = &t.mode {
+								Some(state.clone())
+							} else {
+								None
+							}
+						})
+				} else if let Mode::StorageUsage(state) = &self.mode {
+					Some(state.clone())
+				} else {
+					None
+				};
+
+				if let Some(storage_snapshot) = storage_state {
 					self.status = format!("Reading {}...", path);
 					let peer = self.peer.clone();
 					let command = Command::perform(
@@ -2484,11 +2501,19 @@ impl Application for GuiApp {
 							result,
 						},
 					);
-					self.mode = Mode::FileViewer(FileViewerState::from_storage(
+					let viewer_state = FileViewerState::from_storage(
 						storage_snapshot,
 						node_id,
 						path,
-					));
+					);
+					// Update both self.mode and active tab's mode
+					self.mode = Mode::FileViewer(viewer_state.clone());
+					if let Some(active_id) = self.active_tab_id {
+						if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == active_id) {
+							tab.mode = Mode::FileViewer(viewer_state);
+							tab.update_title();
+						}
+					}
 					return command;
 				}
 				Command::none()
