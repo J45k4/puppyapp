@@ -2428,17 +2428,35 @@ impl Application for GuiApp {
 				Command::none()
 			}
 			GuiMessage::StorageUsageLoaded(result) => {
+				// Update self.mode
 				if let Mode::StorageUsage(state) = &mut self.mode {
 					state.loading = false;
-					match result {
+					match &result {
 						Ok(nodes) => {
-							state.nodes = nodes;
+							state.nodes = nodes.clone();
 							state.error = None;
 							self.status = String::from("Storage usage loaded");
 						}
 						Err(err) => {
 							state.error = Some(err.clone());
 							self.status = format!("Failed to load storage usage: {}", err);
+						}
+					}
+				}
+				// Also update active tab's mode if it's StorageUsage
+				if let Some(active_id) = self.active_tab_id {
+					if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == active_id) {
+						if let Mode::StorageUsage(state) = &mut tab.mode {
+							state.loading = false;
+							match result {
+								Ok(nodes) => {
+									state.nodes = nodes;
+									state.error = None;
+								}
+								Err(err) => {
+									state.error = Some(err);
+								}
+							}
 						}
 					}
 				}
