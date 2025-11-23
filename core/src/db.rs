@@ -696,6 +696,8 @@ pub struct SearchFilesArgs {
 	pub date_to: Option<String>,
 	pub mime_type: Option<String>,
 	pub sort_desc: bool,
+	pub page: usize,
+	pub page_size: usize,
 }
 
 /// Search result with file info and replica count
@@ -711,27 +713,12 @@ pub struct FileSearchResult {
 }
 
 /// Search files using file_entries and file_locations tables
+/// Returns (results, mime_types, total_count)
 pub fn search_files(
 	conn: &Connection,
 	args: SearchFilesArgs,
-) -> anyhow::Result<(Vec<FileSearchResult>, Vec<String>)> {
-	// Build dynamic SQL query
-	let mut sql = String::from(
-		"SELECT
-			fe.hash,
-			COALESCE(
-				(SELECT fl2.path FROM file_locations fl2 WHERE fl2.hash = fe.hash LIMIT 1),
-				''
-			) as name,
-			fe.size,
-			fe.mime_type,
-			(SELECT COUNT(*) FROM file_locations fl3 WHERE fl3.hash = fe.hash) as replicas,
-			fe.first_datetime,
-			fe.latest_datetime
-		FROM file_entries fe
-		WHERE 1=1",
-	);
-
+) -> anyhow::Result<(Vec<FileSearchResult>, Vec<String>, usize)> {
+	// Build WHERE conditions
 	let mut conditions: Vec<String> = Vec::new();
 	let mut param_values: Vec<String> = Vec::new();
 
@@ -770,26 +757,47 @@ pub fn search_files(
 		}
 	}
 
-	// Add conditions to SQL
-	for condition in conditions {
-		sql.push_str(" AND ");
-		sql.push_str(&condition);
-	}
-
-	// Add sorting
-	if args.sort_desc {
-		sql.push_str(" ORDER BY fe.latest_datetime DESC");
+	// Build WHERE clause
+	let where_clause = if conditions.is_empty() {
+		String::new()
 	} else {
-		sql.push_str(" ORDER BY fe.latest_datetime ASC");
-	}
+		format!(" WHERE {}", conditions.join(" AND "))
+	};
 
-	// Limit results
-	sql.push_str(" LIMIT 1000");
+	// First, get total count
+	let count_sql = format!("SELECT COUNT(*) FROM file_entries fe{}", where_clause);
+	let params: Vec<&dyn ToSql> = param_values.iter().map(|s| s as &dyn ToSql).collect();
+	let total_count: i64 = conn.query_row(&count_sql, params.as_slice(), |row| row.get(0))?;
+
+	// Build data query with pagination
+	let page_size = if args.page_size == 0 { 50 } else { args.page_size };
+	let offset = args.page * page_size;
+
+	let order_clause = if args.sort_desc {
+		" ORDER BY fe.latest_datetime DESC"
+	} else {
+		" ORDER BY fe.latest_datetime ASC"
+	};
+
+	let data_sql = format!(
+		"SELECT
+			fe.hash,
+			COALESCE(
+				(SELECT fl2.path FROM file_locations fl2 WHERE fl2.hash = fe.hash LIMIT 1),
+				''
+			) as name,
+			fe.size,
+			fe.mime_type,
+			(SELECT COUNT(*) FROM file_locations fl3 WHERE fl3.hash = fe.hash) as replicas,
+			fe.first_datetime,
+			fe.latest_datetime
+		FROM file_entries fe{}{}
+		LIMIT {} OFFSET {}",
+		where_clause, order_clause, page_size, offset
+	);
 
 	// Execute query
-	let mut stmt = conn.prepare(&sql)?;
-
-	// Convert param_values to references for rusqlite
+	let mut stmt = conn.prepare(&data_sql)?;
 	let params: Vec<&dyn ToSql> = param_values.iter().map(|s| s as &dyn ToSql).collect();
 
 	let rows = stmt.query_map(params.as_slice(), |row| {
@@ -825,7 +833,7 @@ pub fn search_files(
 		mime_types.push(mime?);
 	}
 
-	Ok((results, mime_types))
+	Ok((results, mime_types, total_count.max(0) as usize))
 }
 
 const RULE_TYPE_OWNER: i64 = 0;

@@ -2112,10 +2112,11 @@ impl PuppyNet {
 	}
 
 	/// Search files using file_entries and file_locations tables
+	/// Returns (results, mime_types, total_count)
 	pub fn search_files(
 		&self,
 		args: crate::db::SearchFilesArgs,
-	) -> Result<(Vec<crate::db::FileSearchResult>, Vec<String>), String> {
+	) -> Result<(Vec<crate::db::FileSearchResult>, Vec<String>, usize), String> {
 		let conn = self
 			.db
 			.lock()

@@ -415,6 +415,10 @@ struct FileSearchState {
 	results: Vec<FileSearchEntry>,
 	loading: bool,
 	error: Option<String>,
+	// Pagination
+	page: usize,
+	page_size: usize,
+	total_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -504,6 +508,9 @@ impl FileSearchState {
 			results: Vec::new(),
 			loading: false,
 			error: None,
+			page: 0,
+			page_size: 50,
+			total_count: 0,
 		}
 	}
 }
@@ -763,7 +770,9 @@ pub enum GuiMessage {
 	FileSearchMimeChanged(String),
 	FileSearchToggleSort,
 	FileSearchExecute,
-	FileSearchLoaded(Result<(Vec<FileSearchEntry>, Vec<String>), String>),
+	FileSearchLoaded(Result<(Vec<FileSearchEntry>, Vec<String>, usize), String>),
+	FilesNextPage,
+	FilesPrevPage,
 	ScanPathChanged(String),
 	ScanRequested,
 	ScanEventReceived {
@@ -1582,6 +1591,7 @@ impl Application for GuiApp {
 					state.loading = true;
 					state.error = None;
 					state.results.clear();
+					state.page = 0; // Reset to first page on new search
 					let name_query = state.name_query.clone();
 					let content_query = state.content_query.clone();
 					let date_from = state.date_from.clone();
@@ -1592,9 +1602,11 @@ impl Application for GuiApp {
 						Some(state.selected_mime.clone())
 					};
 					let sort_desc = state.sort_desc;
+					let page = state.page;
+					let page_size = state.page_size;
 					let peer = self.peer.clone();
 					return Command::perform(
-						search_files(peer, name_query, content_query, date_from, date_to, mime, sort_desc),
+						search_files(peer, name_query, content_query, date_from, date_to, mime, sort_desc, page, page_size),
 						GuiMessage::FileSearchLoaded,
 					);
 				}
@@ -1604,15 +1616,73 @@ impl Application for GuiApp {
 				if let Mode::FileSearch(state) = &mut self.mode {
 					state.loading = false;
 					match result {
-						Ok((entries, mimes)) => {
+						Ok((entries, mimes, total)) => {
 							state.results = entries;
 							state.available_mime_types = mimes;
-							self.status = format!("Search loaded: {} files", state.results.len());
+							state.total_count = total;
+							let start = state.page * state.page_size + 1;
+							let end = (start + state.results.len()).saturating_sub(1);
+							self.status = format!("Showing {}-{} of {} files", start, end, total);
 						}
 						Err(err) => {
 							state.error = Some(err.clone());
 							self.status = format!("Search failed: {}", err);
 						}
+					}
+				}
+				Command::none()
+			}
+			GuiMessage::FilesNextPage => {
+				if let Mode::FileSearch(state) = &mut self.mode {
+					let max_page = state.total_count.saturating_sub(1) / state.page_size;
+					if state.page < max_page {
+						state.page += 1;
+						state.loading = true;
+						state.error = None;
+						let name_query = state.name_query.clone();
+						let content_query = state.content_query.clone();
+						let date_from = state.date_from.clone();
+						let date_to = state.date_to.clone();
+						let mime = if state.selected_mime.trim().is_empty() {
+							None
+						} else {
+							Some(state.selected_mime.clone())
+						};
+						let sort_desc = state.sort_desc;
+						let page = state.page;
+						let page_size = state.page_size;
+						let peer = self.peer.clone();
+						return Command::perform(
+							search_files(peer, name_query, content_query, date_from, date_to, mime, sort_desc, page, page_size),
+							GuiMessage::FileSearchLoaded,
+						);
+					}
+				}
+				Command::none()
+			}
+			GuiMessage::FilesPrevPage => {
+				if let Mode::FileSearch(state) = &mut self.mode {
+					if state.page > 0 {
+						state.page -= 1;
+						state.loading = true;
+						state.error = None;
+						let name_query = state.name_query.clone();
+						let content_query = state.content_query.clone();
+						let date_from = state.date_from.clone();
+						let date_to = state.date_to.clone();
+						let mime = if state.selected_mime.trim().is_empty() {
+							None
+						} else {
+							Some(state.selected_mime.clone())
+						};
+						let sort_desc = state.sort_desc;
+						let page = state.page;
+						let page_size = state.page_size;
+						let peer = self.peer.clone();
+						return Command::perform(
+							search_files(peer, name_query, content_query, date_from, date_to, mime, sort_desc, page, page_size),
+							GuiMessage::FileSearchLoaded,
+						);
 					}
 				}
 				Command::none()
@@ -2730,7 +2800,45 @@ impl GuiApp {
 						.push(text(&entry.latest).size(14).width(Length::FillPortion(2)));
 					list = list.push(container(row).padding(4));
 				}
-				layout.push(scrollable(list).height(Length::Fill)).into()
+				layout = layout.push(scrollable(list).height(Length::Fill));
+
+				// Pagination controls
+				let total_pages = if state.total_count == 0 {
+					1
+				} else {
+					(state.total_count + state.page_size - 1) / state.page_size
+				};
+				let start = state.page * state.page_size + 1;
+				let end = (start + state.results.len()).saturating_sub(1);
+				let page_info = format!(
+					"Page {} of {} ({}-{} of {})",
+					state.page + 1,
+					total_pages,
+					if state.total_count == 0 { 0 } else { start },
+					end,
+					state.total_count
+				);
+
+				let mut prev_btn = button(text("Previous"));
+				if state.page > 0 {
+					prev_btn = prev_btn.on_press(GuiMessage::FilesPrevPage);
+				}
+
+				let mut next_btn = button(text("Next"));
+				let max_page = state.total_count.saturating_sub(1) / state.page_size.max(1);
+				if state.page < max_page && state.total_count > 0 {
+					next_btn = next_btn.on_press(GuiMessage::FilesNextPage);
+				}
+
+				let pagination_row = iced::widget::Row::new()
+					.spacing(12)
+					.align_items(iced::Alignment::Center)
+					.push(prev_btn)
+					.push(text(page_info).size(14))
+					.push(next_btn);
+				layout = layout.push(pagination_row);
+
+				layout.into()
 			}
 			FilesViewMode::Thumbnails => {
 				// Placeholder for thumbnails view - will show a simple message for now
@@ -3403,7 +3511,9 @@ async fn search_files(
 	date_to: String,
 	mime: Option<String>,
 	sort_desc: bool,
-) -> Result<(Vec<FileSearchEntry>, Vec<String>), String> {
+	page: usize,
+	page_size: usize,
+) -> Result<(Vec<FileSearchEntry>, Vec<String>, usize), String> {
 	let args = puppynet_core::SearchFilesArgs {
 		name_query: if name_query.trim().is_empty() {
 			None
@@ -3423,9 +3533,11 @@ async fn search_files(
 		},
 		mime_type: mime,
 		sort_desc,
+		page,
+		page_size,
 	};
 
-	let (results, mimes) = task::spawn_blocking(move || peer.search_files(args))
+	let (results, mimes, total) = task::spawn_blocking(move || peer.search_files(args))
 		.await
 		.map_err(|err| format!("search task failed: {err}"))??;
 
@@ -3445,7 +3557,7 @@ async fn search_files(
 		})
 		.collect();
 
-	Ok((entries, mimes))
+	Ok((entries, mimes, total))
 }
 
 async fn load_scan_results_page(
