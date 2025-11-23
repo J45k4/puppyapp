@@ -1720,13 +1720,21 @@ impl Application for GuiApp {
 				}
 				Command::none()
 			}
-			GuiMessage::FilesOpenFile { node_id, path, mime } => {
+			GuiMessage::FilesOpenFile { node_id: _, path, mime } => {
 				if let Mode::FileSearch(state) = &self.mode {
+					// Use local peer ID for reading local files
+					let peer_id = match &self.local_peer_id {
+						Some(id) => id.clone(),
+						None => {
+							self.status = String::from("Error: Local peer ID not available");
+							return Command::none();
+						}
+					};
 					let files_snapshot = state.clone();
 					self.status = format!("Reading {}...", path);
 					let peer = self.peer.clone();
 					let command = Command::perform(
-						read_file(peer, node_id.clone(), path.clone(), 0),
+						read_file(peer, peer_id.clone(), path.clone(), 0),
 						|(peer_id, path, offset, result)| GuiMessage::FileReadLoaded {
 							peer_id,
 							path,
@@ -1736,7 +1744,7 @@ impl Application for GuiApp {
 					);
 					self.mode = Mode::FileViewer(FileViewerState::from_files(
 						files_snapshot,
-						node_id,
+						peer_id,
 						path,
 						mime,
 					));
