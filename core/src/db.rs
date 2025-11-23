@@ -705,6 +705,8 @@ pub struct SearchFilesArgs {
 pub struct FileSearchResult {
 	pub hash: Vec<u8>,
 	pub name: String,
+	pub path: String,
+	pub node_id: Vec<u8>,
 	pub size: u64,
 	pub mime_type: Option<String>,
 	pub replicas: u64,
@@ -785,7 +787,11 @@ pub fn search_files(
 			COALESCE(
 				(SELECT fl2.path FROM file_locations fl2 WHERE fl2.hash = fe.hash LIMIT 1),
 				''
-			) as name,
+			) as path,
+			COALESCE(
+				(SELECT fl2.node_id FROM file_locations fl2 WHERE fl2.hash = fe.hash LIMIT 1),
+				X''
+			) as node_id,
 			fe.size,
 			fe.mime_type,
 			(SELECT COUNT(*) FROM file_locations fl3 WHERE fl3.hash = fe.hash) as replicas,
@@ -802,6 +808,7 @@ pub fn search_files(
 
 	let rows = stmt.query_map(params.as_slice(), |row| {
 		let path: String = row.get(1)?;
+		let node_id: Vec<u8> = row.get(2)?;
 		// Extract filename from path
 		let name = path
 			.rsplit(|c| c == '/' || c == '\\')
@@ -811,11 +818,13 @@ pub fn search_files(
 		Ok(FileSearchResult {
 			hash: row.get(0)?,
 			name,
-			size: row.get::<_, i64>(2)? as u64,
-			mime_type: row.get(3)?,
-			replicas: row.get::<_, i64>(4)? as u64,
-			first_datetime: row.get(5)?,
-			latest_datetime: row.get(6)?,
+			path,
+			node_id,
+			size: row.get::<_, i64>(3)? as u64,
+			mime_type: row.get(4)?,
+			replicas: row.get::<_, i64>(5)? as u64,
+			first_datetime: row.get(6)?,
+			latest_datetime: row.get(7)?,
 		})
 	})?;
 

@@ -235,6 +235,7 @@ impl FileBrowserState {
 enum FileViewerSource {
 	FileBrowser(FileBrowserState),
 	StorageUsage(StorageUsageState),
+	Files(FileSearchState),
 }
 
 #[derive(Debug, Clone)]
@@ -280,6 +281,21 @@ impl FileViewerState {
 			peer_id,
 			mime: detected_mime,
 			source: FileViewerSource::StorageUsage(storage),
+			data: Vec::new(),
+			offset: 0,
+			eof: false,
+			loading: true,
+			error: None,
+			path,
+		}
+	}
+
+	fn from_files(files_state: FileSearchState, peer_id: String, path: String, mime: Option<String>) -> Self {
+		let detected_mime = mime.or_else(|| Self::guess_mime(&path));
+		Self {
+			peer_id,
+			mime: detected_mime,
+			source: FileViewerSource::Files(files_state),
 			data: Vec::new(),
 			offset: 0,
 			eof: false,
@@ -425,6 +441,8 @@ struct FileSearchState {
 pub struct FileSearchEntry {
 	hash: String,
 	name: String,
+	path: String,
+	node_id: String,
 	size: u64,
 	mime_type: Option<String>,
 	replicas: u64,
@@ -773,6 +791,11 @@ pub enum GuiMessage {
 	FileSearchLoaded(Result<(Vec<FileSearchEntry>, Vec<String>, usize), String>),
 	FilesNextPage,
 	FilesPrevPage,
+	FilesOpenFile {
+		node_id: String,
+		path: String,
+		mime: Option<String>,
+	},
 	ScanPathChanged(String),
 	ScanRequested,
 	ScanEventReceived {
@@ -1500,6 +1523,10 @@ impl Application for GuiApp {
 							self.status = String::from("Storage usage");
 							self.mode = Mode::StorageUsage(storage);
 						}
+						FileViewerSource::Files(files) => {
+							self.status = String::from("Files");
+							self.mode = Mode::FileSearch(files);
+						}
 					}
 				}
 				Command::none()
@@ -1684,6 +1711,30 @@ impl Application for GuiApp {
 							GuiMessage::FileSearchLoaded,
 						);
 					}
+				}
+				Command::none()
+			}
+			GuiMessage::FilesOpenFile { node_id, path, mime } => {
+				if let Mode::FileSearch(state) = &self.mode {
+					let files_snapshot = state.clone();
+					self.status = format!("Reading {}...", path);
+					let peer = self.peer.clone();
+					let command = Command::perform(
+						read_file(peer, node_id.clone(), path.clone(), 0),
+						|(peer_id, path, offset, result)| GuiMessage::FileReadLoaded {
+							peer_id,
+							path,
+							offset,
+							result,
+						},
+					);
+					self.mode = Mode::FileViewer(FileViewerState::from_files(
+						files_snapshot,
+						node_id,
+						path,
+						mime,
+					));
+					return command;
 				}
 				Command::none()
 			}
@@ -2798,7 +2849,22 @@ impl GuiApp {
 						.push(text(entry.replicas.to_string()).size(14).width(Length::FillPortion(1)))
 						.push(text(&entry.first).size(14).width(Length::FillPortion(2)))
 						.push(text(&entry.latest).size(14).width(Length::FillPortion(2)));
-					list = list.push(container(row).padding(4));
+
+					// Make row clickable if we have a valid path and node_id
+					if !entry.path.is_empty() && !entry.node_id.is_empty() {
+						let row_button = button(row)
+							.width(Length::Fill)
+							.padding(4)
+							.style(theme::Button::Text)
+							.on_press(GuiMessage::FilesOpenFile {
+								node_id: entry.node_id.clone(),
+								path: entry.path.clone(),
+								mime: entry.mime_type.clone(),
+							});
+						list = list.push(row_button);
+					} else {
+						list = list.push(container(row).padding(4));
+					}
 				}
 				layout = layout.push(scrollable(list).height(Length::Fill));
 
@@ -3545,9 +3611,12 @@ async fn search_files(
 		.into_iter()
 		.map(|row| {
 			let hash = row.hash.iter().map(|b| format!("{:02x}", b)).collect();
+			let node_id = row.node_id.iter().map(|b| format!("{:02x}", b)).collect();
 			FileSearchEntry {
 				hash,
 				name: row.name,
+				path: row.path,
+				node_id,
 				size: row.size,
 				mime_type: row.mime_type,
 				replicas: row.replicas,
@@ -3575,6 +3644,8 @@ async fn load_scan_results_page(
 			FileSearchEntry {
 				hash,
 				name: String::new(), // TODO: populate from database
+				path: String::new(), // TODO: populate from database
+				node_id: String::new(), // TODO: populate from database
 				size: row.size,
 				mime_type: row.mime_type,
 				replicas: 0, // TODO: populate from database
