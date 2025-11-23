@@ -4096,17 +4096,39 @@ impl GuiApp {
 	}
 
 	fn toggle_storage_node(&mut self, index: usize) {
+		// Update self.mode
 		if let Mode::StorageUsage(state) = &mut self.mode {
 			if let Some(node) = state.nodes.get_mut(index) {
 				node.expanded = !node.expanded;
 			}
 		}
+		// Also update active tab's mode
+		if let Some(active_id) = self.active_tab_id {
+			if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == active_id) {
+				if let Mode::StorageUsage(state) = &mut tab.mode {
+					if let Some(node) = state.nodes.get_mut(index) {
+						node.expanded = !node.expanded;
+					}
+				}
+			}
+		}
 	}
 
 	fn toggle_storage_entry(&mut self, index: usize, path: &str) {
+		// Update self.mode
 		if let Mode::StorageUsage(state) = &mut self.mode {
 			if let Some(node) = state.nodes.get_mut(index) {
 				toggle_storage_entry_recursive(&mut node.entries, path);
+			}
+		}
+		// Also update active tab's mode
+		if let Some(active_id) = self.active_tab_id {
+			if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == active_id) {
+				if let Mode::StorageUsage(state) = &mut tab.mode {
+					if let Some(node) = state.nodes.get_mut(index) {
+						toggle_storage_entry_recursive(&mut node.entries, path);
+					}
+				}
 			}
 		}
 	}
