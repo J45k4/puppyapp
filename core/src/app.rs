@@ -2111,6 +2111,38 @@ impl PuppyNet {
 		Ok((entries, total_entries.max(0) as usize))
 	}
 
+	/// Search files using file_entries and file_locations tables
+	/// Returns (results, mime_types, total_count)
+	pub fn search_files(
+		&self,
+		args: crate::db::SearchFilesArgs,
+	) -> Result<(Vec<crate::db::FileSearchResult>, Vec<String>, usize), String> {
+		let conn = self
+			.db
+			.lock()
+			.map_err(|err| format!("db lock poisoned: {err}"))?;
+		crate::db::search_files(&conn, args).map_err(|err| format!("search failed: {err}"))
+	}
+
+	/// Get all available mime types from file_entries
+	pub fn get_mime_types(&self) -> Result<Vec<String>, String> {
+		let conn = self
+			.db
+			.lock()
+			.map_err(|err| format!("db lock poisoned: {err}"))?;
+		let mut stmt = conn
+			.prepare("SELECT DISTINCT mime_type FROM file_entries WHERE mime_type IS NOT NULL")
+			.map_err(|err| format!("failed to prepare mime types query: {err}"))?;
+		let rows = stmt
+			.query_map((), |row| row.get::<_, String>(0))
+			.map_err(|err| format!("failed to query mime types: {err}"))?;
+		let mut mime_types = Vec::new();
+		for mime in rows {
+			mime_types.push(mime.map_err(|err| format!("failed to read mime type: {err}"))?);
+		}
+		Ok(mime_types)
+	}
+
 	pub async fn read_file(
 		&self,
 		peer: libp2p::PeerId,

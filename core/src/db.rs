@@ -687,6 +687,164 @@ pub fn get_file_location(
 	}
 }
 
+/// Search arguments for filtering files
+#[derive(Debug, Default)]
+pub struct SearchFilesArgs {
+	pub name_query: Option<String>,
+	pub content_query: Option<String>,
+	pub date_from: Option<String>,
+	pub date_to: Option<String>,
+	pub mime_type: Option<String>,
+	pub sort_desc: bool,
+	pub page: usize,
+	pub page_size: usize,
+}
+
+/// Search result with file info and replica count
+#[derive(Debug, Clone)]
+pub struct FileSearchResult {
+	pub hash: Vec<u8>,
+	pub name: String,
+	pub path: String,
+	pub node_id: Vec<u8>,
+	pub size: u64,
+	pub mime_type: Option<String>,
+	pub replicas: u64,
+	pub first_datetime: Option<String>,
+	pub latest_datetime: Option<String>,
+}
+
+/// Search files using file_entries and file_locations tables
+/// Returns (results, mime_types, total_count)
+pub fn search_files(
+	conn: &Connection,
+	args: SearchFilesArgs,
+) -> anyhow::Result<(Vec<FileSearchResult>, Vec<String>, usize)> {
+	// Build WHERE conditions
+	let mut conditions: Vec<String> = Vec::new();
+	let mut param_values: Vec<String> = Vec::new();
+
+	// Name search - search in file_locations paths
+	if let Some(ref name) = args.name_query {
+		if !name.trim().is_empty() {
+			conditions.push(format!(
+				"EXISTS (SELECT 1 FROM file_locations fl WHERE fl.hash = fe.hash AND fl.path LIKE ?{})",
+				param_values.len() + 1
+			));
+			param_values.push(format!("%{}%", name));
+		}
+	}
+
+	// Mime type filter
+	if let Some(ref mime) = args.mime_type {
+		if !mime.trim().is_empty() {
+			conditions.push(format!("fe.mime_type = ?{}", param_values.len() + 1));
+			param_values.push(mime.clone());
+		}
+	}
+
+	// Date from filter
+	if let Some(ref date_from) = args.date_from {
+		if !date_from.trim().is_empty() {
+			conditions.push(format!("fe.first_datetime >= ?{}", param_values.len() + 1));
+			param_values.push(date_from.clone());
+		}
+	}
+
+	// Date to filter
+	if let Some(ref date_to) = args.date_to {
+		if !date_to.trim().is_empty() {
+			conditions.push(format!("fe.latest_datetime <= ?{}", param_values.len() + 1));
+			param_values.push(date_to.clone());
+		}
+	}
+
+	// Build WHERE clause
+	let where_clause = if conditions.is_empty() {
+		String::new()
+	} else {
+		format!(" WHERE {}", conditions.join(" AND "))
+	};
+
+	// First, get total count
+	let count_sql = format!("SELECT COUNT(*) FROM file_entries fe{}", where_clause);
+	let params: Vec<&dyn ToSql> = param_values.iter().map(|s| s as &dyn ToSql).collect();
+	let total_count: i64 = conn.query_row(&count_sql, params.as_slice(), |row| row.get(0))?;
+
+	// Build data query with pagination
+	let page_size = if args.page_size == 0 { 50 } else { args.page_size };
+	let offset = args.page * page_size;
+
+	let order_clause = if args.sort_desc {
+		" ORDER BY fe.latest_datetime DESC"
+	} else {
+		" ORDER BY fe.latest_datetime ASC"
+	};
+
+	let data_sql = format!(
+		"SELECT
+			fe.hash,
+			COALESCE(
+				(SELECT fl2.path FROM file_locations fl2 WHERE fl2.hash = fe.hash LIMIT 1),
+				''
+			) as path,
+			COALESCE(
+				(SELECT fl2.node_id FROM file_locations fl2 WHERE fl2.hash = fe.hash LIMIT 1),
+				X''
+			) as node_id,
+			fe.size,
+			fe.mime_type,
+			(SELECT COUNT(*) FROM file_locations fl3 WHERE fl3.hash = fe.hash) as replicas,
+			fe.first_datetime,
+			fe.latest_datetime
+		FROM file_entries fe{}{}
+		LIMIT {} OFFSET {}",
+		where_clause, order_clause, page_size, offset
+	);
+
+	// Execute query
+	let mut stmt = conn.prepare(&data_sql)?;
+	let params: Vec<&dyn ToSql> = param_values.iter().map(|s| s as &dyn ToSql).collect();
+
+	let rows = stmt.query_map(params.as_slice(), |row| {
+		let path: String = row.get(1)?;
+		let node_id: Vec<u8> = row.get(2)?;
+		// Extract filename from path
+		let name = path
+			.rsplit(|c| c == '/' || c == '\\')
+			.next()
+			.unwrap_or(&path)
+			.to_string();
+		Ok(FileSearchResult {
+			hash: row.get(0)?,
+			name,
+			path,
+			node_id,
+			size: row.get::<_, i64>(3)? as u64,
+			mime_type: row.get(4)?,
+			replicas: row.get::<_, i64>(5)? as u64,
+			first_datetime: row.get(6)?,
+			latest_datetime: row.get(7)?,
+		})
+	})?;
+
+	let mut results = Vec::new();
+	for row in rows {
+		results.push(row?);
+	}
+
+	// Also fetch available mime types for the filter dropdown
+	let mut mime_stmt =
+		conn.prepare("SELECT DISTINCT mime_type FROM file_entries WHERE mime_type IS NOT NULL")?;
+	let mime_rows = mime_stmt.query_map((), |row| row.get::<_, String>(0))?;
+	let mut mime_types = Vec::new();
+	for mime in mime_rows {
+		mime_types.push(mime?);
+	}
+
+	Ok((results, mime_types, total_count.max(0) as usize))
+}
+
 const RULE_TYPE_OWNER: i64 = 0;
 const RULE_TYPE_FOLDER: i64 = 1;
 
