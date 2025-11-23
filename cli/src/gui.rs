@@ -1701,27 +1701,29 @@ impl Application for GuiApp {
 					state.view_mode = mode;
 					// When switching to Thumbnails mode, fetch thumbnails for existing results
 					if mode == FilesViewMode::Thumbnails && old_mode != FilesViewMode::Thumbnails && !state.results.is_empty() {
-						state.thumbnails.clear();
-						let mut thumbnail_commands = Vec::new();
-						for entry in &state.results {
-							if FileSearchState::is_image_entry(entry) {
-								let key = FileSearchState::thumbnail_key(&entry.node_id, &entry.path);
-								state.thumbnails.insert(key.clone(), ThumbnailState::Loading);
-								let peer = self.peer.clone();
-								thumbnail_commands.push(Command::perform(
-									fetch_files_page_thumbnail(
-										peer,
-										entry.node_id.clone(),
-										entry.path.clone(),
-										key,
-										entry.hash.clone(),
-									),
-									|(key, result)| GuiMessage::FilesPageThumbnailLoaded { key, result },
-								));
+						if let Some(local_id) = &self.local_peer_id {
+							state.thumbnails.clear();
+							let mut thumbnail_commands = Vec::new();
+							for entry in &state.results {
+								if FileSearchState::is_image_entry(entry) {
+									let key = FileSearchState::thumbnail_key(&entry.node_id, &entry.path);
+									state.thumbnails.insert(key.clone(), ThumbnailState::Loading);
+									let peer = self.peer.clone();
+									thumbnail_commands.push(Command::perform(
+										fetch_files_page_thumbnail(
+											peer,
+											local_id.clone(),
+											entry.path.clone(),
+											key,
+											entry.hash.clone(),
+										),
+										|(key, result)| GuiMessage::FilesPageThumbnailLoaded { key, result },
+									));
+								}
 							}
-						}
-						if !thumbnail_commands.is_empty() {
-							return Command::batch(thumbnail_commands);
+							if !thumbnail_commands.is_empty() {
+								return Command::batch(thumbnail_commands);
+							}
 						}
 					}
 				}
@@ -1798,21 +1800,23 @@ impl Application for GuiApp {
 							// Collect thumbnail commands for image files when in Thumbnails mode
 							let mut thumbnail_commands = Vec::new();
 							if state.view_mode == FilesViewMode::Thumbnails {
-								for entry in &entries {
-									if FileSearchState::is_image_entry(entry) {
-										let key = FileSearchState::thumbnail_key(&entry.node_id, &entry.path);
-										state.thumbnails.insert(key.clone(), ThumbnailState::Loading);
-										let peer = self.peer.clone();
-										thumbnail_commands.push(Command::perform(
-											fetch_files_page_thumbnail(
-												peer,
-												entry.node_id.clone(),
-												entry.path.clone(),
-												key,
-												entry.hash.clone(),
-											),
-											|(key, result)| GuiMessage::FilesPageThumbnailLoaded { key, result },
-										));
+								if let Some(local_id) = &self.local_peer_id {
+									for entry in &entries {
+										if FileSearchState::is_image_entry(entry) {
+											let key = FileSearchState::thumbnail_key(&entry.node_id, &entry.path);
+											state.thumbnails.insert(key.clone(), ThumbnailState::Loading);
+											let peer = self.peer.clone();
+											thumbnail_commands.push(Command::perform(
+												fetch_files_page_thumbnail(
+													peer,
+													local_id.clone(),
+													entry.path.clone(),
+													key,
+													entry.hash.clone(),
+												),
+												|(key, result)| GuiMessage::FilesPageThumbnailLoaded { key, result },
+											));
+										}
 									}
 								}
 							}
