@@ -4471,6 +4471,26 @@ async fn search_files(
 		page_size,
 	};
 
+	// Build a map from truncated node_id (first 16 bytes) to full PeerId
+	let peer_map: HashMap<Vec<u8>, PeerId> = {
+		let state_arc = peer.state();
+		let state = state_arc.lock().map_err(|e| e.to_string())?;
+		let mut peers = vec![state.me];
+		peers.extend(state.connections.iter().map(|c| c.peer_id));
+		peers.extend(state.discovered_peers.iter().map(|d| d.peer_id));
+		peers
+			.into_iter()
+			.filter_map(|peer_id| {
+				let bytes = peer_id.to_bytes();
+				if bytes.len() >= 16 {
+					Some((bytes[..16].to_vec(), peer_id))
+				} else {
+					None
+				}
+			})
+			.collect()
+	};
+
 	let (results, mimes, total) = task::spawn_blocking(move || peer.search_files(args))
 		.await
 		.map_err(|err| format!("search task failed: {err}"))??;
@@ -4479,7 +4499,11 @@ async fn search_files(
 		.into_iter()
 		.map(|row| {
 			let hash = row.hash.iter().map(|b| format!("{:02x}", b)).collect();
-			let node_id = row.node_id.iter().map(|b| format!("{:02x}", b)).collect();
+			// Convert truncated node_id bytes to full PeerId string (Base58)
+			let node_id = peer_map
+				.get(&row.node_id)
+				.map(|pid| pid.to_string())
+				.unwrap_or_else(|| row.node_id.iter().map(|b| format!("{:02x}", b)).collect());
 			FileSearchEntry {
 				hash,
 				name: row.name,
