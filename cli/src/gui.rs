@@ -22,8 +22,8 @@ use libp2p::PeerId;
 use puppynet_core::p2p::{CpuInfo, DirEntry, DiskInfo, InterfaceInfo};
 use puppynet_core::scan::ScanEvent;
 use puppynet_core::{
-	FLAG_READ, FLAG_SEARCH, FLAG_WRITE, FileChunk, FolderRule, Permission, PuppyNet, Rule, State,
-	StorageUsageFile, Thumbnail, UpdateProgress,
+	FLAG_READ, FLAG_SEARCH, FLAG_WRITE, FileChunk, FolderRule, Permission, PuppyNet, Rule, ScanHandle,
+	State, StorageUsageFile, Thumbnail, UpdateProgress,
 };
 use tokio::task;
 
@@ -671,7 +671,7 @@ struct StorageUsageState {
 #[derive(Clone)]
 struct ActiveScan {
 	id: u64,
-	receiver: Arc<Mutex<mpsc::Receiver<ScanEvent>>>,
+	handle: ScanHandle,
 }
 
 #[derive(Clone)]
@@ -1048,6 +1048,7 @@ pub enum GuiMessage {
 	FilesScrolled(scrollable::Viewport),
 	ScanPathChanged(String),
 	ScanRequested,
+	ScanCancelRequested,
 	ScanEventReceived {
 		id: u64,
 		event: ScanEvent,
@@ -2293,21 +2294,31 @@ impl Application for GuiApp {
 				self.status = format!("Scanning {}...", requested);
 				let scan_id = self.next_scan_id;
 				self.next_scan_id += 1;
-				let receiver = match self.peer.scan_folder(requested.clone()) {
-					Ok(receiver) => receiver,
+				let handle = match self.peer.scan_folder(requested.clone()) {
+					Ok(handle) => handle,
 					Err(err) => {
 						state.scanning = false;
 						state.error = Some(err);
 						return Command::none();
 					}
 				};
+				let receiver = handle.receiver();
 				self.active_scan = Some(ActiveScan {
 					id: scan_id,
-					receiver: receiver.clone(),
+					handle: handle.clone(),
 				});
 				Command::perform(wait_for_scan_event(receiver), move |event| {
 					GuiMessage::ScanEventReceived { id: scan_id, event }
 				})
+			}
+			GuiMessage::ScanCancelRequested => {
+				if let Some(active) = &self.active_scan {
+					active.handle.cancel();
+					let message = format!("Stopping scan {}...", self.scan_state.path);
+					self.scan_state.status = Some(message.clone());
+					self.status = message;
+				}
+				Command::none()
 			}
 			GuiMessage::ScanEventReceived { id, event } => {
 				if self.active_scan.as_ref().map(|scan| scan.id) != Some(id) {
@@ -2368,7 +2379,7 @@ impl Application for GuiApp {
 				}
 				if should_poll {
 					if let Some(active) = &self.active_scan {
-						let receiver = active.receiver.clone();
+						let receiver = active.handle.receiver();
 						return Command::perform(wait_for_scan_event(receiver), move |event| {
 							GuiMessage::ScanEventReceived { id, event }
 						});
@@ -3869,7 +3880,11 @@ impl GuiApp {
 		} else {
 			scan_btn = scan_btn.on_press(GuiMessage::ScanRequested);
 		}
-		controls = controls.push(scan_btn).push(
+		controls = controls.push(scan_btn);
+		if state.scanning {
+			controls = controls.push(button(text("Stop scan")).on_press(GuiMessage::ScanCancelRequested));
+		}
+		controls = controls.push(
 			button(text("View scan results"))
 				.on_press(GuiMessage::MenuSelected(MenuItem::ScanResults)),
 		);

@@ -26,7 +26,7 @@ use std::{
 	env,
 	net::IpAddr,
 	path::{Path, PathBuf},
-	sync::atomic::{AtomicU64, Ordering},
+	sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use sysinfo::{Disks, Networks, System};
 use tokio::fs;
@@ -88,6 +88,7 @@ pub enum Command {
 	Scan {
 		path: String,
 		tx: mpsc::Sender<ScanEvent>,
+		cancel_flag: Arc<AtomicBool>,
 	},
 	RemoteScan {
 		peer: PeerId,
@@ -1601,7 +1602,7 @@ impl App {
 				self.pending_requests
 					.insert(request_id, Pending::<FileChunk>::new(req.tx));
 			}
-			Command::Scan { path, tx } => {
+			Command::Scan { path, tx, cancel_flag } => {
 				let node_id = match self.local_node_id() {
 					Some(id) => id,
 					None => {
@@ -1612,14 +1613,21 @@ impl App {
 					}
 				};
 				let db = Arc::clone(&self.db);
+				let cancel_flag = Arc::clone(&cancel_flag);
 				tokio::task::spawn_blocking(move || {
 					let result = db
 						.lock()
 						.map_err(|err| format!("db lock poisoned: {}", err))
 						.and_then(|mut guard| {
-							scan::scan_with_progress(&node_id, &path, &mut *guard, |progress| {
+							scan::scan_with_progress_cancelable(
+								&node_id,
+								&path,
+								&mut *guard,
+								|progress| {
 								let _ = tx.send(ScanEvent::Progress(progress.clone()));
-							})
+								},
+								|| cancel_flag.load(Ordering::SeqCst),
+							)
 						});
 					let final_event = match result {
 						Ok(stats) => ScanEvent::Finished(Ok(stats)),
@@ -1802,6 +1810,22 @@ pub struct ScanResultRow {
 	pub latest_datetime: Option<String>,
 }
 
+#[derive(Clone)]
+pub struct ScanHandle {
+	receiver: Arc<Mutex<mpsc::Receiver<ScanEvent>>>,
+	cancel_flag: Arc<AtomicBool>,
+}
+
+impl ScanHandle {
+	pub fn receiver(&self) -> Arc<Mutex<mpsc::Receiver<ScanEvent>>> {
+		Arc::clone(&self.receiver)
+	}
+
+	pub fn cancel(&self) {
+		self.cancel_flag.store(true, Ordering::SeqCst);
+	}
+}
+
 pub struct PuppyNet {
 	shutdown_tx: Option<oneshot::Sender<()>>,
 	handle: JoinHandle<()>,
@@ -1955,7 +1979,7 @@ impl PuppyNet {
 		&self,
 		peer: PeerId,
 		path: impl Into<String>,
-	) -> Result<Arc<Mutex<mpsc::Receiver<ScanEvent>>>, String> {
+	) -> Result<ScanHandle, String> {
 		let path = path.into();
 		{
 			let state = self
@@ -1982,14 +2006,17 @@ impl PuppyNet {
 				self.remote_scans.lock().unwrap().remove(&scan_id);
 				format!("failed to send RemoteScan command: {e}")
 			})?;
-		Ok(Arc::new(Mutex::new(rx)))
+		Ok(ScanHandle {
+			receiver: Arc::new(Mutex::new(rx)),
+			cancel_flag: Arc::new(AtomicBool::new(false)),
+		})
 	}
 
 	pub fn scan_remote_peer_blocking(
 		&self,
 		peer: PeerId,
 		path: impl Into<String>,
-	) -> Result<Arc<Mutex<mpsc::Receiver<ScanEvent>>>, String> {
+	) -> Result<ScanHandle, String> {
 		self.scan_remote_peer(peer, path)
 	}
 
@@ -2058,13 +2085,21 @@ impl PuppyNet {
 	pub fn scan_folder(
 		&self,
 		path: impl Into<String>,
-	) -> Result<Arc<Mutex<mpsc::Receiver<ScanEvent>>>, String> {
+	) -> Result<ScanHandle, String> {
 		let path = path.into();
 		let (tx, rx) = mpsc::channel();
+		let cancel_flag = Arc::new(AtomicBool::new(false));
 		self.cmd_tx
-			.send(Command::Scan { path, tx })
+			.send(Command::Scan {
+				path,
+				tx,
+				cancel_flag: Arc::clone(&cancel_flag),
+			})
 			.map_err(|e| format!("failed to send Scan command: {e}"))?;
-		Ok(Arc::new(Mutex::new(rx)))
+		Ok(ScanHandle {
+			receiver: Arc::new(Mutex::new(rx)),
+			cancel_flag,
+		})
 	}
 
 	pub fn fetch_scan_results_page(

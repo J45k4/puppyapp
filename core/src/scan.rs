@@ -142,6 +142,16 @@ fn should_emit_progress(processed: usize, total: usize) -> bool {
 		|| total < PROGRESS_REPORT_INTERVAL
 }
 
+fn cancel_if_requested<C>(cancel: &mut C) -> Result<(), String>
+where
+	C: FnMut() -> bool,
+{
+	if cancel() {
+		return Err(String::from("Scan cancelled"));
+	}
+	Ok(())
+}
+
 pub fn scan<P: AsRef<Path>>(
 	node_id: &[u8],
 	path: P,
@@ -154,11 +164,26 @@ pub fn scan_with_progress<P, F>(
 	node_id: &[u8],
 	path: P,
 	conn: &mut Connection,
-	mut progress: F,
+	progress: F,
 ) -> Result<ScanResult, String>
 where
 	P: AsRef<Path>,
 	F: FnMut(ScanProgress),
+{
+	scan_with_progress_cancelable(node_id, path, conn, progress, || false)
+}
+
+pub fn scan_with_progress_cancelable<P, F, C>(
+	node_id: &[u8],
+	path: P,
+	conn: &mut Connection,
+	mut progress: F,
+	mut should_cancel: C,
+) -> Result<ScanResult, String>
+where
+	P: AsRef<Path>,
+	F: FnMut(ScanProgress),
+	C: FnMut() -> bool,
 {
 	let timer = std::time::Instant::now();
 	let mut updated_count = 0;
@@ -214,6 +239,7 @@ where
 		updated_count,
 		removed_count,
 	);
+	cancel_if_requested(&mut should_cancel)?;
 
 	let mut scanned: HashMap<PathBuf, FileLocation>;
 	#[cfg(feature = "rayon")]
@@ -256,6 +282,7 @@ where
 		drop(tx);
 		let mut map = HashMap::new();
 		for (pbuf, fl) in rx {
+			cancel_if_requested(&mut should_cancel)?;
 			map.insert(pbuf, fl);
 			processed_files += 1;
 			if should_emit_progress(processed_files, total_files) {
@@ -275,6 +302,7 @@ where
 	{
 		let mut map = HashMap::new();
 		for entry in entries {
+			cancel_if_requested(&mut should_cancel)?;
 			let pbuf = entry.path().to_path_buf();
 			let meta = std::fs::metadata(&pbuf).unwrap();
 			let created_at = to_datetime(meta.created());
@@ -325,6 +353,7 @@ where
 	{
 		let mut delete_stmt = tx.prepare(DELETE_FILE_LOCATION).unwrap();
 		for old in existing.keys() {
+			cancel_if_requested(&mut should_cancel)?;
 			if !scanned.contains_key(old) {
 				delete_stmt
 					.execute(&[&node_id as &dyn ToSql, &old.to_string_lossy() as &dyn ToSql])
@@ -346,6 +375,7 @@ where
 		let mut insert_stmt = tx.prepare(INSERT_FILE_LOCATION).unwrap();
 		let mut update_stmt = tx.prepare(UPDATE_FILE_LOCATION).unwrap();
 		for (path, fl) in scanned.iter() {
+			cancel_if_requested(&mut should_cancel)?;
 			if let Some(prev) = existing.get(path) {
 				if fl == prev {
 					continue;
@@ -392,6 +422,7 @@ where
 	{
 		let mut upsert_stmt = tx.prepare(UPSERT_FILE_ENTRY).unwrap();
 		for fl in scanned.values() {
+			cancel_if_requested(&mut should_cancel)?;
 			let timestamps: Vec<_> = [fl.created_at, fl.modified_at, fl.accessed_at]
 				.iter()
 				.copied()
