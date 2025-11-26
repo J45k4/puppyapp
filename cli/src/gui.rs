@@ -1773,6 +1773,11 @@ impl Application for GuiApp {
 			}
 			GuiMessage::CpuRequested(peer_id) => {
 				self.status = format!("Loading CPU info for {}...", peer_id);
+				self.selected_peer_id = Some(peer_id.clone());
+				self.set_active_tab_mode(Mode::PeerCpus(PeerCpuState {
+					peer_id: peer_id.clone(),
+					cpus: Vec::new(),
+				}));
 				let peer = self.peer.clone();
 				Command::perform(fetch_cpus(peer, peer_id.clone()), move |(id, result)| {
 					GuiMessage::CpuLoaded(id, result)
@@ -1782,11 +1787,11 @@ impl Application for GuiApp {
 				match result {
 					Ok(cpus) => {
 						self.status = cpu_summary(&cpus);
-						self.mode = Mode::PeerCpus(PeerCpuState { peer_id, cpus });
+						self.set_active_tab_mode(Mode::PeerCpus(PeerCpuState { peer_id, cpus }));
 					}
 					Err(err) => {
 						self.status = format!("Failed to load CPU info: {}", err);
-						self.mode = Mode::Peers;
+						self.set_active_tab_mode(Mode::Peers);
 					}
 				}
 				Command::none()
@@ -1794,7 +1799,9 @@ impl Application for GuiApp {
 			GuiMessage::InterfacesRequested(peer_id) => {
 				self.status = format!("Loading interfaces for {}...", peer_id);
 				self.selected_peer_id = Some(peer_id.clone());
-				self.mode = Mode::PeerInterfaces(PeerInterfacesState::loading(peer_id.clone()));
+				self.set_active_tab_mode(Mode::PeerInterfaces(PeerInterfacesState::loading(
+					peer_id.clone(),
+				)));
 				let peer = self.peer.clone();
 				return Command::perform(
 					fetch_interfaces(peer, peer_id.clone()),
@@ -1808,21 +1815,29 @@ impl Application for GuiApp {
 				peer_id,
 				interfaces,
 			} => {
-				if let Mode::PeerInterfaces(state) = &mut self.mode {
-					if state.peer_id == peer_id {
-						state.loading = false;
-						match interfaces {
-							Ok(list) => {
-								state.interfaces = list;
-								state.error = None;
-								self.status = format!("Interfaces loaded for {}", peer_id);
-							}
-							Err(err) => {
-								state.error = Some(err.clone());
-								self.status = format!("Failed to load interfaces: {}", err);
+				let mut status_update: Option<String> = None;
+				self.with_active_mode_mut(|mode| {
+					if let Mode::PeerInterfaces(state) = mode {
+						if state.peer_id == peer_id {
+							state.loading = false;
+							match interfaces.clone() {
+								Ok(list) => {
+									state.interfaces = list;
+									state.error = None;
+									status_update =
+										Some(format!("Interfaces loaded for {}", peer_id));
+								}
+								Err(err) => {
+									state.error = Some(err.clone());
+									status_update =
+										Some(format!("Failed to load interfaces: {}", err));
+								}
 							}
 						}
 					}
+				});
+				if let Some(status) = status_update {
+					self.status = status;
 				}
 				Command::none()
 			}
