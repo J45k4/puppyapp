@@ -90,18 +90,16 @@ pub enum MenuItem {
 	Peers,
 	PeersGraph,
 	Users,
-	CreateUser,
 	FileSearch,
 	StorageUsage,
 	ScanResults,
 	Quit,
 }
 
-const MENU_ITEMS: [MenuItem; 8] = [
+const MENU_ITEMS: [MenuItem; 7] = [
 	MenuItem::Peers,
 	MenuItem::PeersGraph,
 	MenuItem::Users,
-	MenuItem::CreateUser,
 	MenuItem::FileSearch,
 	MenuItem::StorageUsage,
 	MenuItem::ScanResults,
@@ -114,7 +112,6 @@ impl MenuItem {
 			MenuItem::Peers => "Peers",
 			MenuItem::PeersGraph => "Peers Graph",
 			MenuItem::Users => "Users",
-			MenuItem::CreateUser => "Create User",
 			MenuItem::FileSearch => "Files",
 			MenuItem::StorageUsage => "Storage Usage",
 			MenuItem::ScanResults => "Scan Results",
@@ -1399,20 +1396,6 @@ impl Application for GuiApp {
 							None => String::from("Graph overview — no peers"),
 						};
 					}
-					MenuItem::CreateUser => {
-				self.menu = item;
-				let form = CreateUserForm::new();
-				// Update active tab's mode
-				if let Some(active_id) = self.active_tab_id {
-					if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == active_id) {
-						tab.mode = Mode::CreateUser(form.clone());
-						tab.menu = item;
-						tab.update_title();
-					}
-				}
-				self.mode = Mode::CreateUser(form);
-				self.status = String::from("Create user form");
-			}
 					MenuItem::Users => {
 						self.menu = item;
 						let state = UsersState::loading();
@@ -1521,7 +1504,7 @@ impl Application for GuiApp {
 			}
 			GuiMessage::UsersCreateNew => {
 				let form = CreateUserForm::new();
-				self.menu = MenuItem::CreateUser;
+				self.menu = MenuItem::Users;
 				self.set_active_tab_mode(Mode::CreateUser(form));
 				self.status = String::from("Create user form");
 				Command::none()
