@@ -3160,44 +3160,32 @@ impl Application for GuiApp {
 			self.view_mode_content()
 		};
 
-		// Always show tab bar when we have tabs
-		let content_area: Element<_> = if !self.tabs.is_empty() {
-			let tab_bar = self.view_tab_bar();
-			iced::widget::Column::new()
-				.spacing(0)
-				.push(tab_bar)
-				.push(
-					container(content)
-						.width(Length::Fill)
-						.height(Length::Fill)
-						.padding(16)
-						.style(theme::Container::Box),
-				)
-				.into()
-		} else {
-			container(content)
-				.width(Length::Fill)
-				.height(Length::Fill)
-				.padding(16)
-				.style(theme::Container::Box)
-				.into()
-		};
+		let content_area: Element<_> = container(content)
+			.width(Length::Fill)
+			.height(Length::Fill)
+			.padding(16)
+			.style(theme::Container::Box)
+			.into();
 
 		let main = iced::widget::Row::new()
 			.spacing(16)
 			.push(sidebar)
 			.push(content_area)
 			.height(Length::Fill);
+
 		let status = container(text(&self.status).size(16))
 			.width(Length::Fill)
 			.padding(12)
 			.style(theme::Container::Box);
-		iced::widget::Column::new()
-			.spacing(12)
-			.padding(12)
-			.push(main)
-			.push(status)
-			.into()
+
+		let mut layout = iced::widget::Column::new()
+			.spacing(0)
+			.padding([0, 12, 12, 12]);
+		if !self.tabs.is_empty() {
+			layout = layout.push(self.view_tab_bar());
+		}
+		layout = layout.push(main).push(status);
+		layout.into()
 	}
 }
 
@@ -3319,7 +3307,7 @@ impl GuiApp {
 
 		container(tabs_row)
 			.width(Length::Fill)
-			.padding([8, 8])
+			.padding([0, 8, 16, 8])
 			.style(theme::Container::Box)
 			.into()
 	}
