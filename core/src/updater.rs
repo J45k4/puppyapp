@@ -141,9 +141,7 @@ where
 			log::info!("latest numeric tag: {}", tag_number);
 			if tag_number <= current_version {
 				log::info!("Already up to date");
-				progress_callback(UpdateProgress::AlreadyUpToDate {
-					current_version,
-				});
+				progress_callback(UpdateProgress::AlreadyUpToDate { current_version });
 				return Ok(UpdateResult {
 					success: true,
 					message: "Already up to date".to_string(),
@@ -254,12 +252,17 @@ where
 			}
 		}
 		Ok(())
-	}).await??;
+	})
+	.await??;
 
 	progress_callback(UpdateProgress::Verifying);
 
 	// Use platform-specific binary name
-	let bin_name = if cfg!(windows) { "puppynet.exe" } else { "puppynet" };
+	let bin_name = if cfg!(windows) {
+		"puppynet.exe"
+	} else {
+		"puppynet"
+	};
 	let bin_path = app_dir().join(bin_name);
 
 	// List directory contents for debugging
@@ -270,9 +273,18 @@ where
 
 	// Check that binary exists
 	if !bin_path.exists() {
-		log::error!("Binary not found at {:?}, directory contains: {:?}", bin_path, entries);
-		let error = format!("Binary not found: {:?}. Directory contains: {:?}", bin_path, entries);
-		progress_callback(UpdateProgress::Failed { error: error.clone() });
+		log::error!(
+			"Binary not found at {:?}, directory contains: {:?}",
+			bin_path,
+			entries
+		);
+		let error = format!(
+			"Binary not found: {:?}. Directory contains: {:?}",
+			bin_path, entries
+		);
+		progress_callback(UpdateProgress::Failed {
+			error: error.clone(),
+		});
 		bail!("{}", error);
 	}
 
@@ -301,7 +313,9 @@ where
 				"Signature file not found. Tried: {:?}, also searched for any .sig file. Directory contains: {:?}",
 				known_sig_names, entries
 			);
-			progress_callback(UpdateProgress::Failed { error: error.clone() });
+			progress_callback(UpdateProgress::Failed {
+				error: error.clone(),
+			});
 			bail!("{}", error);
 		}
 	};
@@ -309,9 +323,9 @@ where
 	// Verify signature in blocking context
 	let bin_path_clone = bin_path.clone();
 	let sig_path_clone = sig_path.clone();
-	let verify_result = tokio::task::spawn_blocking(move || {
-		verify_signature(&bin_path_clone, &sig_path_clone)
-	}).await??;
+	let verify_result =
+		tokio::task::spawn_blocking(move || verify_signature(&bin_path_clone, &sig_path_clone))
+			.await??;
 
 	if !verify_result {
 		let error = "Signature verification failed".to_string();
@@ -328,9 +342,7 @@ where
 	tokio::fs::remove_file(&sig_path).await?;
 
 	let tag_clone = tag.clone();
-	progress_callback(UpdateProgress::Completed {
-		version: tag_clone,
-	});
+	progress_callback(UpdateProgress::Completed { version: tag_clone });
 
 	Ok(UpdateResult {
 		success: true,

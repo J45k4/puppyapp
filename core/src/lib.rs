@@ -1,6 +1,8 @@
 mod app;
 mod db;
+pub mod http_api;
 pub mod p2p;
+mod puppynet;
 pub mod scan;
 mod state;
 mod types;
@@ -8,7 +10,7 @@ pub mod updater;
 pub use state::{FLAG_READ, FLAG_SEARCH, FLAG_WRITE, FolderRule, Permission, Rule, State};
 pub use types::FileChunk;
 pub mod wait_group;
-pub use app::{PuppyNet, ScanHandle, ScanResultRow};
 pub use db::{FileEntry, FileSearchResult, SearchFilesArgs, StorageUsageFile};
 pub use p2p::Thumbnail;
+pub use puppynet::{PuppyNet, ScanHandle, ScanResultRow};
 pub use updater::{UpdateProgress, UpdateResult};

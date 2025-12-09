@@ -1,4 +1,5 @@
 use std::env;
+use std::str::FromStr;
 use std::path::PathBuf;
 
 use anyhow::{anyhow, bail};
@@ -13,7 +14,7 @@ use tokio::sync::Mutex;
 
 use crate::scan::FileHash;
 use crate::scan::FileLocation;
-use crate::state::{FolderRule, Permission, Rule, User};
+use crate::state::{DiscoveredPeer, FolderRule, Peer, Permission, Rule, User};
 
 pub type NodeID = [u8; 16];
 
@@ -143,6 +144,21 @@ const MIGRATIONS: &[Migration] = &[
 			);
 		",
 	},
+	Migration {
+		id: 20250301,
+		name: "peers_and_discovered",
+		sql: r"
+			create table if not exists peers (
+				peer_id text primary key,
+				name text null
+			);
+			create table if not exists discovered_peers (
+				peer_id text not null,
+				multiaddr text not null,
+				primary key (peer_id, multiaddr)
+			);
+		",
+	},
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -245,7 +261,7 @@ pub struct FileEntry {
 	pub latest_datetime: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct StorageUsageFile {
 	pub node_id: Vec<u8>,
 	pub node_name: String,
@@ -704,6 +720,8 @@ pub struct SearchFilesArgs {
 	pub content_query: Option<String>,
 	pub date_from: Option<String>,
 	pub date_to: Option<String>,
+	pub replicas_min: Option<u64>,
+	pub replicas_max: Option<u64>,
 	pub mime_type: Option<String>,
 	pub sort_desc: bool,
 	pub page: usize,
@@ -711,7 +729,7 @@ pub struct SearchFilesArgs {
 }
 
 /// Search result with file info and replica count
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct FileSearchResult {
 	pub hash: Vec<u8>,
 	pub name: String,
@@ -769,6 +787,24 @@ pub fn search_files(
 		}
 	}
 
+	// Replicas min filter
+	if let Some(min) = args.replicas_min {
+		conditions.push(format!(
+			"(SELECT COUNT(*) FROM file_locations fl3 WHERE fl3.hash = fe.hash) >= ?{}",
+			param_values.len() + 1
+		));
+		param_values.push(min.to_string());
+	}
+
+	// Replicas max filter
+	if let Some(max) = args.replicas_max {
+		conditions.push(format!(
+			"(SELECT COUNT(*) FROM file_locations fl3 WHERE fl3.hash = fe.hash) <= ?{}",
+			param_values.len() + 1
+		));
+		param_values.push(max.to_string());
+	}
+
 	// Build WHERE clause
 	let where_clause = if conditions.is_empty() {
 		String::new()
@@ -782,7 +818,11 @@ pub fn search_files(
 	let total_count: i64 = conn.query_row(&count_sql, params.as_slice(), |row| row.get(0))?;
 
 	// Build data query with pagination
-	let page_size = if args.page_size == 0 { 50 } else { args.page_size };
+	let page_size = if args.page_size == 0 {
+		50
+	} else {
+		args.page_size
+	};
 	let offset = args.page * page_size;
 
 	let order_clause = if args.sort_desc {
@@ -853,6 +893,78 @@ pub fn search_files(
 	}
 
 	Ok((results, mime_types, total_count.max(0) as usize))
+}
+
+/// Save or update a peer entry.
+pub fn save_peer(conn: &Connection, peer: &Peer) -> anyhow::Result<()> {
+	conn.execute(
+		"INSERT INTO peers (peer_id, name) VALUES (?1, ?2)
+		 ON CONFLICT(peer_id) DO UPDATE SET name = excluded.name",
+		params![peer.id.to_string(), peer.name],
+	)?;
+	Ok(())
+}
+
+/// Load all peers.
+pub fn load_peers(conn: &Connection) -> anyhow::Result<Vec<Peer>> {
+	let mut stmt = conn.prepare("SELECT peer_id, name FROM peers")?;
+	let rows = stmt.query_map([], |row| {
+		let id_str: String = row.get(0)?;
+		let id = libp2p::PeerId::from_str(&id_str)
+			.map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+		Ok(Peer {
+			id,
+			name: row.get(1)?,
+		})
+	})?;
+	let mut peers = Vec::new();
+	for row in rows {
+		peers.push(row?);
+	}
+	Ok(peers)
+}
+
+/// Save or update a discovered peer entry.
+pub fn save_discovered_peer(conn: &Connection, peer: &DiscoveredPeer) -> anyhow::Result<()> {
+	conn.execute(
+		"INSERT INTO discovered_peers (peer_id, multiaddr) VALUES (?1, ?2)
+		 ON CONFLICT(peer_id, multiaddr) DO NOTHING",
+		params![peer.peer_id.to_string(), peer.multiaddr.to_string()],
+	)?;
+	Ok(())
+}
+
+/// Remove a discovered peer entry.
+pub fn remove_discovered_peer(
+	conn: &Connection,
+	peer_id: &libp2p::PeerId,
+	multiaddr: &libp2p::Multiaddr,
+) -> anyhow::Result<()> {
+	conn.execute(
+		"DELETE FROM discovered_peers WHERE peer_id = ?1 AND multiaddr = ?2",
+		params![peer_id.to_string(), multiaddr.to_string()],
+	)?;
+	Ok(())
+}
+
+/// Load all discovered peers.
+pub fn load_discovered_peers(conn: &Connection) -> anyhow::Result<Vec<DiscoveredPeer>> {
+	let mut stmt = conn.prepare("SELECT peer_id, multiaddr FROM discovered_peers")?;
+	let rows = stmt.query_map([], |row| {
+		let id_str: String = row.get(0)?;
+		let addr_str: String = row.get(1)?;
+		let peer_id = libp2p::PeerId::from_str(&id_str)
+			.map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+		let multiaddr = addr_str
+			.parse()
+			.map_err(|e| rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e)))?;
+		Ok(DiscoveredPeer { peer_id, multiaddr })
+	})?;
+	let mut peers = Vec::new();
+	for row in rows {
+		peers.push(row?);
+	}
+	Ok(peers)
 }
 
 const RULE_TYPE_OWNER: i64 = 0;

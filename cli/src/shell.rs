@@ -20,9 +20,7 @@ use ratatui::{
 	backend::CrosstermBackend,
 	layout::{Constraint, Direction, Layout, Rect},
 	style::{Color, Modifier, Style},
-	widgets::{
-		Block, Borders, List, ListItem, ListState, Paragraph, Wrap,
-	},
+	widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 const LOCAL_LISTEN_MULTIADDR: &str = "/ip4/0.0.0.0:8336";
 
@@ -387,12 +385,7 @@ impl ShellApp {
 		state.select(Some(0));
 		Self {
 			should_quit: false,
-			menu_items: vec![
-				"peers",
-				"create token",
-				"create user",
-				"quit",
-			],
+			menu_items: vec!["peers", "create token", "create user", "quit"],
 			menu_state: state,
 			status_line: "Use ↑/↓ to navigate, Enter to select, q to quit".to_string(),
 			mode: Mode::Menu,
@@ -1085,9 +1078,8 @@ impl ShellApp {
 
 	fn periodic_refresh(&mut self) {
 		if self.last_refresh.elapsed() >= self.refresh_interval {
-			// Pull latest core state (Arc<Mutex<State>>) via instance and take a snapshot clone
-			let state_arc = self.peer.state();
-			let snapshot = state_arc.lock().ok().map(|s| s.clone());
+			// Pull latest core state snapshot via instance
+			let snapshot = self.peer.state_snapshot();
 			if let Some(state) = snapshot.clone() {
 				self.latest_state = Some(state);
 			}

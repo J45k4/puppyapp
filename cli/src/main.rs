@@ -1,12 +1,13 @@
 use args::Command;
 use clap::Parser;
-use puppynet_core::PuppyNet;
+use puppynet_core::{PuppyNet, http_api};
+use std::net::SocketAddr;
+use std::sync::Arc;
 
 mod args;
 mod gui;
 mod installer;
 mod shell;
-mod types;
 mod updater;
 mod utility;
 
@@ -71,7 +72,7 @@ async fn main() {
 			return;
 		}
 		None => {
-			let peer = PuppyNet::new();
+			let peer = Arc::new(PuppyNet::new());
 			for path in &args.read {
 				if let Err(err) = peer.share_read_only_folder(path) {
 					log::error!("failed to share {} for read: {err:?}", path);
@@ -84,7 +85,41 @@ async fn main() {
 					std::process::exit(1);
 				}
 			}
-			peer.wait().await;
+			let mut http_task = None;
+			if let Some(addr_str) = &args.http {
+				match addr_str.parse::<SocketAddr>() {
+					Ok(addr) => {
+						let puppy = Arc::clone(&peer);
+						let handle = tokio::spawn(async move {
+							if let Err(err) = http_api::serve(puppy, addr).await {
+								log::error!("http server error: {err:?}");
+							}
+						});
+						http_task = Some(handle);
+					}
+					Err(err) => {
+						log::error!("invalid --http address {}: {err}", addr_str);
+						std::process::exit(1);
+					}
+				}
+			}
+
+			if http_task.is_some() {
+				if let Err(err) = tokio::signal::ctrl_c().await {
+					log::error!("failed to listen for ctrl_c: {err}");
+				}
+				if let Some(task) = http_task {
+					task.abort();
+					let _ = task.await;
+				}
+			}
+
+			match Arc::try_unwrap(peer) {
+				Ok(p) => p.wait().await,
+				Err(_) => {
+					log::warn!("PuppyNet still in use; skipping graceful shutdown");
+				}
+			}
 			return;
 		}
 	}

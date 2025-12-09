@@ -22,10 +22,10 @@ use libp2p::PeerId;
 use puppynet_core::p2p::{CpuInfo, DirEntry, DiskInfo, InterfaceInfo};
 use puppynet_core::scan::ScanEvent;
 use puppynet_core::{
-	FLAG_READ, FLAG_SEARCH, FLAG_WRITE, FileChunk, FolderRule, Permission, PuppyNet, Rule, ScanHandle,
-	State, StorageUsageFile, Thumbnail, UpdateProgress,
+	FLAG_READ, FLAG_SEARCH, FLAG_WRITE, FileChunk, FolderRule, Permission, PuppyNet, Rule,
+	ScanHandle, State, StorageUsageFile, Thumbnail, UpdateProgress,
 };
-use tokio::task;
+use tokio::{task, time::timeout};
 
 const LOCAL_LISTEN_MULTIADDR: &str = "/ip4/0.0.0.0:8336";
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
@@ -366,7 +366,12 @@ impl FileViewerState {
 			.map(|s| s.to_string())
 	}
 
-	fn from_browser(browser: FileBrowserState, peer_id: String, path: String, mime: Option<String>) -> Self {
+	fn from_browser(
+		browser: FileBrowserState,
+		peer_id: String,
+		path: String,
+		mime: Option<String>,
+	) -> Self {
 		// Use provided mime, or guess from path
 		let detected_mime = mime.or_else(|| Self::guess_mime(&path));
 		Self {
@@ -398,7 +403,12 @@ impl FileViewerState {
 		}
 	}
 
-	fn from_files(files_state: FileSearchState, peer_id: String, path: String, mime: Option<String>) -> Self {
+	fn from_files(
+		files_state: FileSearchState,
+		peer_id: String,
+		path: String,
+		mime: Option<String>,
+	) -> Self {
 		let detected_mime = mime.or_else(|| Self::guess_mime(&path));
 		Self {
 			peer_id,
@@ -492,7 +502,12 @@ struct Tab {
 
 impl Tab {
 	fn new(id: usize, title: String, mode: Mode, menu: MenuItem) -> Self {
-		Self { id, title, mode, menu }
+		Self {
+			id,
+			title,
+			mode,
+			menu,
+		}
 	}
 
 	/// Create a new tab with Peers view
@@ -502,7 +517,12 @@ impl Tab {
 
 	/// Create a new tab with Files search view
 	fn file_search(id: usize, state: FileSearchState) -> Self {
-		Self::new(id, "Files".to_string(), Mode::FileSearch(state), MenuItem::FileSearch)
+		Self::new(
+			id,
+			"Files".to_string(),
+			Mode::FileSearch(state),
+			MenuItem::FileSearch,
+		)
 	}
 
 	/// Create a new tab with File browser view
@@ -543,12 +563,22 @@ impl Tab {
 
 	/// Create a new tab with Storage usage view
 	fn storage_usage(id: usize, state: StorageUsageState) -> Self {
-		Self::new(id, "Storage".to_string(), Mode::StorageUsage(state), MenuItem::StorageUsage)
+		Self::new(
+			id,
+			"Storage".to_string(),
+			Mode::StorageUsage(state),
+			MenuItem::StorageUsage,
+		)
 	}
 
 	/// Create a new tab with Scan results view
 	fn scan_results(id: usize, state: ScanResultsState) -> Self {
-		Self::new(id, "Scan Results".to_string(), Mode::ScanResults(state), MenuItem::ScanResults)
+		Self::new(
+			id,
+			"Scan Results".to_string(),
+			Mode::ScanResults(state),
+			MenuItem::ScanResults,
+		)
 	}
 
 	/// Get icon for the tab based on mode
@@ -634,6 +664,8 @@ struct FileSearchState {
 	content_query: String,
 	date_from: String,
 	date_to: String,
+	replicas_min: String,
+	replicas_max: String,
 	selected_mime: String,
 	mime_filter_input: String,
 	available_mime_types: Vec<String>,
@@ -733,6 +765,8 @@ impl FileSearchState {
 			content_query: String::new(),
 			date_from: String::new(),
 			date_to: String::new(),
+			replicas_min: String::new(),
+			replicas_max: String::new(),
 			selected_mime: String::new(),
 			mime_filter_input: String::new(),
 			available_mime_types: Vec::new(),
@@ -758,6 +792,38 @@ impl FileSearchState {
 			.as_deref()
 			.map(|m| m.starts_with("image/"))
 			.unwrap_or(false)
+	}
+
+	fn parse_replicas_filters(&self) -> Result<(Option<u64>, Option<u64>), String> {
+		let min = if self.replicas_min.trim().is_empty() {
+			None
+		} else {
+			Some(
+				self.replicas_min
+					.trim()
+					.parse::<u64>()
+					.map_err(|_| String::from("Invalid minimum replicas value"))?,
+			)
+		};
+
+		let max = if self.replicas_max.trim().is_empty() {
+			None
+		} else {
+			Some(
+				self.replicas_max
+					.trim()
+					.parse::<u64>()
+					.map_err(|_| String::from("Invalid maximum replicas value"))?,
+			)
+		};
+
+		if let (Some(min), Some(max)) = (min, max) {
+			if min > max {
+				return Err(String::from("Minimum replicas cannot exceed maximum"));
+			}
+		}
+
+		Ok((min, max))
 	}
 }
 
@@ -854,10 +920,12 @@ async fn list_disks(
 }
 
 async fn load_local_users(peer: Arc<PuppyNet>) -> Result<Vec<String>, String> {
-	peer.state()
-		.lock()
-		.map(|s| s.users.iter().map(|u| u.name.clone()).collect())
-		.map_err(|err| format!("state lock poisoned: {}", err))
+	let handle = task::spawn_blocking(move || peer.list_users_db());
+	match timeout(Duration::from_secs(3), handle).await {
+		Ok(Ok(res)) => res,
+		Ok(Err(err)) => Err(format!("users task failed: {err}")),
+		Err(_) => Err(String::from("loading users timed out")),
+	}
 }
 
 async fn create_user(
@@ -871,8 +939,7 @@ async fn create_user(
 }
 
 fn shared_folder_suggestions(peer: &Arc<PuppyNet>) -> Vec<EditableFolderPermission> {
-	peer.state()
-		.lock()
+	peer.state_snapshot()
 		.map(|s| {
 			s.shared_folders
 				.iter()
@@ -897,11 +964,20 @@ async fn list_effective_permissions(
 	peer_id: String,
 ) -> (String, Result<Vec<Permission>, String>) {
 	let target = PeerId::from_str(&peer_id).unwrap();
-	let result = peer
-		.state()
-		.lock()
-		.map(|s| s.permissions_for_peer(&target))
-		.map_err(|e| format!("state lock poisoned: {}", e));
+	let handle = task::spawn_blocking({
+		let peer = peer.clone();
+		let target = target.clone();
+		move || {
+			peer.state_snapshot()
+				.map(|s| s.permissions_for_peer(&target))
+				.ok_or_else(|| String::from("state unavailable"))
+		}
+	});
+	let result = match timeout(Duration::from_secs(3), handle).await {
+		Ok(Ok(res)) => res,
+		Ok(Err(err)) => Err(format!("permissions task failed: {err}")),
+		Err(_) => Err(String::from("permissions lookup timed out")),
+	};
 	(peer_id, result)
 }
 
@@ -927,7 +1003,12 @@ async fn read_file(
 	let target = match PeerId::from_str(&peer_id) {
 		Ok(pid) => pid,
 		Err(err) => {
-			return (peer_id, path, offset, Err(format!("Invalid peer ID: {}", err)));
+			return (
+				peer_id,
+				path,
+				offset,
+				Err(format!("Invalid peer ID: {}", err)),
+			);
 		}
 	};
 	let result = peer
@@ -1005,14 +1086,13 @@ pub struct GuiApp {
 
 impl GuiApp {
 	fn local_node_id_bytes(&self) -> Vec<u8> {
-		if let Ok(state) = self.peer.state().lock() {
-			state.me.to_bytes()
-		} else {
-			self.local_peer_id
-				.as_ref()
-				.map(|id| id.as_bytes().to_vec())
-				.unwrap_or_default()
+		if let Some(state) = self.peer.state_snapshot() {
+			return state.me.to_bytes();
 		}
+		self.local_peer_id
+			.as_ref()
+			.map(|id| id.as_bytes().to_vec())
+			.unwrap_or_default()
 	}
 
 	fn set_active_tab_mode(&mut self, mode: Mode) {
@@ -1165,6 +1245,8 @@ pub enum GuiMessage {
 	FilesDateFromChanged(String),
 	FilesDateToChanged(String),
 	FileSearchMimeChanged(String),
+	FilesReplicasMinChanged(String),
+	FilesReplicasMaxChanged(String),
 	FileSearchToggleSort,
 	FileSearchExecute,
 	FileSearchLoaded(Result<(Vec<FileSearchEntry>, Vec<String>, usize), String>),
@@ -1225,7 +1307,9 @@ pub enum GuiMessage {
 	/// Create a new tab (opens Files search)
 	TabNew,
 	/// Open a file browser in a new tab
-	TabOpenFileBrowser { peer_id: String },
+	TabOpenFileBrowser {
+		peer_id: String,
+	},
 }
 
 impl Application for GuiApp {
@@ -1236,7 +1320,7 @@ impl Application for GuiApp {
 
 	fn new(flags: Self::Flags) -> (Self, Command<Self::Message>) {
 		let peer = Arc::new(PuppyNet::new());
-		let latest_state = peer.state().lock().ok().map(|state| state.clone());
+		let latest_state = peer.state_snapshot();
 		let peers = latest_state
 			.as_ref()
 			.map(aggregate_peers)
@@ -1317,7 +1401,10 @@ impl Application for GuiApp {
 						}
 						self.mode = Mode::Users(state.clone());
 						self.status = String::from("Loading users...");
-						return Command::perform(load_local_users(self.peer.clone()), GuiMessage::UsersLoaded);
+						return Command::perform(
+							load_local_users(self.peer.clone()),
+							GuiMessage::UsersLoaded,
+						);
 					}
 					MenuItem::FileSearch => {
 						self.menu = item;
@@ -1441,12 +1528,7 @@ impl Application for GuiApp {
 					shared_roots,
 				)));
 				let peer = self.peer.clone();
-				let local_id = self
-					.peer
-					.state()
-					.lock()
-					.ok()
-					.map(|s| s.me.to_string());
+				let local_id = self.peer.state_snapshot().map(|s| s.me.to_string());
 				if let Some(id) = local_id {
 					if id == peer_id {
 						return Command::perform(
@@ -1486,8 +1568,7 @@ impl Application for GuiApp {
 										perms,
 										shared_roots,
 									);
-									self.status =
-										format!("Permissions loaded for {}", peer_id);
+									self.status = format!("Permissions loaded for {}", peer_id);
 								}
 								Err(err) => {
 									state.loading = false;
@@ -1660,9 +1741,7 @@ impl Application for GuiApp {
 			GuiMessage::AccessRequestRequested(peer_id) => {
 				self.status = format!("Prepare access request for {}...", peer_id);
 				self.selected_peer_id = Some(peer_id.clone());
-				self.set_active_tab_mode(Mode::AccessRequest(AccessRequestState::new(
-					peer_id,
-				)));
+				self.set_active_tab_mode(Mode::AccessRequest(AccessRequestState::new(peer_id)));
 				Command::none()
 			}
 			GuiMessage::AccessRequestOwnerToggled(value) => {
@@ -1991,12 +2070,17 @@ impl Application for GuiApp {
 								for entry in &entries {
 									if !entry.is_dir && FileBrowserState::is_image_entry(entry) {
 										let full_path = join_child_path(&path, &entry.name);
-										state.thumbnails.insert(full_path.clone(), ThumbnailState::Loading);
+										state
+											.thumbnails
+											.insert(full_path.clone(), ThumbnailState::Loading);
 										let peer = self.peer.clone();
 										let p_id = peer_id.clone();
 										thumbnail_commands.push(Command::perform(
 											fetch_thumbnail(peer, p_id, full_path.clone()),
-											|(path, result)| GuiMessage::ThumbnailLoaded { path, result },
+											|(path, result)| GuiMessage::ThumbnailLoaded {
+												path,
+												result,
+											},
 										));
 									}
 								}
@@ -2114,7 +2198,11 @@ impl Application for GuiApp {
 				let mut next_command = Command::none();
 
 				// Helper to process file read result
-				let process_result = |state: &mut FileViewerState, status: &mut String, peer: &Arc<PuppyNet>, result: Result<FileChunk, String>| -> Command<GuiMessage> {
+				let process_result = |state: &mut FileViewerState,
+				                      status: &mut String,
+				                      peer: &Arc<PuppyNet>,
+				                      result: Result<FileChunk, String>|
+				 -> Command<GuiMessage> {
 					state.loading = false;
 					match result {
 						Ok(chunk) => {
@@ -2127,11 +2215,7 @@ impl Application for GuiApp {
 							let base_status = if state.is_image()
 								&& state.eof && !state.data.is_empty()
 							{
-								format!(
-									"Image loaded: {} bytes | {}",
-									state.data.len(),
-									mime_label
-								)
+								format!("Image loaded: {} bytes | {}", state.data.len(), mime_label)
 							} else {
 								let eof_note = if state.eof { " (end of file)" } else { "" };
 								format!(
@@ -2153,13 +2237,11 @@ impl Application for GuiApp {
 								let peer = peer.clone();
 								return Command::perform(
 									read_file(peer, peer_id.clone(), path.clone(), offset),
-									|(peer_id, path, offset, result)| {
-										GuiMessage::FileReadLoaded {
-											peer_id,
-											path,
-											offset,
-											result,
-										}
+									|(peer_id, path, offset, result)| GuiMessage::FileReadLoaded {
+										peer_id,
+										path,
+										offset,
+										result,
 									},
 								);
 							} else {
@@ -2187,7 +2269,12 @@ impl Application for GuiApp {
 								if state.peer_id == peer_id && state.path == path {
 									found_in_tab = true;
 									let peer = self.peer.clone();
-									next_command = process_result(state, &mut self.status, &peer, result.clone());
+									next_command = process_result(
+										state,
+										&mut self.status,
+										&peer,
+										result.clone(),
+									);
 									break;
 								}
 							}
@@ -2242,7 +2329,8 @@ impl Application for GuiApp {
 							let source = viewer_state.source.clone();
 							match source {
 								FileViewerSource::FileBrowser(browser) => {
-									self.status = format!("Browsing {} on {}", browser.path, browser.peer_id);
+									self.status =
+										format!("Browsing {} on {}", browser.path, browser.peer_id);
 									tab.mode = Mode::FileBrowser(browser);
 									tab.update_title();
 									return Command::none();
@@ -2257,7 +2345,8 @@ impl Application for GuiApp {
 								FileViewerSource::Files(files) => {
 									self.status = String::from("Files");
 									let scroll_offset = files.scroll_offset;
-									let scroll_id = if files.view_mode == FilesViewMode::Thumbnails {
+									let scroll_id = if files.view_mode == FilesViewMode::Thumbnails
+									{
 										"files_thumbnails_grid"
 									} else {
 										"files_table"
@@ -2279,7 +2368,8 @@ impl Application for GuiApp {
 				if let Mode::FileViewer(state) = mem::replace(&mut self.mode, Mode::Peers) {
 					match state.source {
 						FileViewerSource::FileBrowser(browser) => {
-							self.status = format!("Browsing {} on {}", browser.path, browser.peer_id);
+							self.status =
+								format!("Browsing {} on {}", browser.path, browser.peer_id);
 							self.mode = Mode::FileBrowser(browser);
 						}
 						FileViewerSource::StorageUsage(storage) => {
@@ -2384,14 +2474,20 @@ impl Application for GuiApp {
 					let old_mode = state.view_mode;
 					state.view_mode = mode;
 					// When switching to Thumbnails mode, fetch thumbnails for existing results
-					if mode == FilesViewMode::Thumbnails && old_mode != FilesViewMode::Thumbnails && !state.results.is_empty() {
+					if mode == FilesViewMode::Thumbnails
+						&& old_mode != FilesViewMode::Thumbnails
+						&& !state.results.is_empty()
+					{
 						if let Some(local_id) = local_id {
 							state.thumbnails.clear();
 							let mut thumbnail_commands = Vec::new();
 							for entry in &state.results {
 								if FileSearchState::is_image_entry(entry) {
-									let key = FileSearchState::thumbnail_key(&entry.node_id, &entry.path);
-									state.thumbnails.insert(key.clone(), ThumbnailState::Loading);
+									let key =
+										FileSearchState::thumbnail_key(&entry.node_id, &entry.path);
+									state
+										.thumbnails
+										.insert(key.clone(), ThumbnailState::Loading);
 									thumbnail_commands.push(Command::perform(
 										fetch_files_page_thumbnail(
 											peer.clone(),
@@ -2400,7 +2496,10 @@ impl Application for GuiApp {
 											key,
 											entry.hash.clone(),
 										),
-										|(key, result)| GuiMessage::FilesPageThumbnailLoaded { key, result },
+										|(key, result)| GuiMessage::FilesPageThumbnailLoaded {
+											key,
+											result,
+										},
 									));
 								}
 							}
@@ -2436,6 +2535,18 @@ impl Application for GuiApp {
 				}
 				Command::none()
 			}
+			GuiMessage::FilesReplicasMinChanged(v) => {
+				if let Some(state) = self.active_file_search_mut() {
+					state.replicas_min = v;
+				}
+				Command::none()
+			}
+			GuiMessage::FilesReplicasMaxChanged(v) => {
+				if let Some(state) = self.active_file_search_mut() {
+					state.replicas_max = v;
+				}
+				Command::none()
+			}
 			GuiMessage::FileSearchMimeChanged(m) => {
 				if let Some(state) = self.active_file_search_mut() {
 					state.selected_mime = m;
@@ -2458,6 +2569,15 @@ impl Application for GuiApp {
 					let content_query = state.content_query.clone();
 					let date_from = state.date_from.clone();
 					let date_to = state.date_to.clone();
+					let (replicas_min, replicas_max) = match state.parse_replicas_filters() {
+						Ok(values) => values,
+						Err(err) => {
+							state.loading = false;
+							state.error = Some(err.clone());
+							self.status = format!("Search failed: {}", err);
+							return Command::none();
+						}
+					};
 					let mime = if state.selected_mime.trim().is_empty() {
 						None
 					} else {
@@ -2468,7 +2588,19 @@ impl Application for GuiApp {
 					let page_size = state.page_size;
 					let peer = self.peer.clone();
 					return Command::perform(
-						search_files(peer, name_query, content_query, date_from, date_to, mime, sort_desc, page, page_size),
+						search_files(
+							peer,
+							name_query,
+							content_query,
+							date_from,
+							date_to,
+							replicas_min,
+							replicas_max,
+							mime,
+							sort_desc,
+							page,
+							page_size,
+						),
 						GuiMessage::FileSearchLoaded,
 					);
 				}
@@ -2490,8 +2622,13 @@ impl Application for GuiApp {
 								if let Some(local_id) = local_id {
 									for entry in &entries {
 										if FileSearchState::is_image_entry(entry) {
-											let key = FileSearchState::thumbnail_key(&entry.node_id, &entry.path);
-											state.thumbnails.insert(key.clone(), ThumbnailState::Loading);
+											let key = FileSearchState::thumbnail_key(
+												&entry.node_id,
+												&entry.path,
+											);
+											state
+												.thumbnails
+												.insert(key.clone(), ThumbnailState::Loading);
 											thumbnail_commands.push(Command::perform(
 												fetch_files_page_thumbnail(
 													peer.clone(),
@@ -2500,7 +2637,12 @@ impl Application for GuiApp {
 													key,
 													entry.hash.clone(),
 												),
-												|(key, result)| GuiMessage::FilesPageThumbnailLoaded { key, result },
+												|(key, result)| {
+													GuiMessage::FilesPageThumbnailLoaded {
+														key,
+														result,
+													}
+												},
 											));
 										}
 									}
@@ -2535,6 +2677,15 @@ impl Application for GuiApp {
 						let content_query = state.content_query.clone();
 						let date_from = state.date_from.clone();
 						let date_to = state.date_to.clone();
+						let (replicas_min, replicas_max) = match state.parse_replicas_filters() {
+							Ok(values) => values,
+							Err(err) => {
+								state.loading = false;
+								state.error = Some(err.clone());
+								self.status = format!("Search failed: {}", err);
+								return Command::none();
+							}
+						};
 						let mime = if state.selected_mime.trim().is_empty() {
 							None
 						} else {
@@ -2545,7 +2696,19 @@ impl Application for GuiApp {
 						let page_size = state.page_size;
 						let peer = self.peer.clone();
 						return Command::perform(
-							search_files(peer, name_query, content_query, date_from, date_to, mime, sort_desc, page, page_size),
+							search_files(
+								peer,
+								name_query,
+								content_query,
+								date_from,
+								date_to,
+								replicas_min,
+								replicas_max,
+								mime,
+								sort_desc,
+								page,
+								page_size,
+							),
 							GuiMessage::FileSearchLoaded,
 						);
 					}
@@ -2562,6 +2725,15 @@ impl Application for GuiApp {
 						let content_query = state.content_query.clone();
 						let date_from = state.date_from.clone();
 						let date_to = state.date_to.clone();
+						let (replicas_min, replicas_max) = match state.parse_replicas_filters() {
+							Ok(values) => values,
+							Err(err) => {
+								state.loading = false;
+								state.error = Some(err.clone());
+								self.status = format!("Search failed: {}", err);
+								return Command::none();
+							}
+						};
 						let mime = if state.selected_mime.trim().is_empty() {
 							None
 						} else {
@@ -2572,14 +2744,30 @@ impl Application for GuiApp {
 						let page_size = state.page_size;
 						let peer = self.peer.clone();
 						return Command::perform(
-							search_files(peer, name_query, content_query, date_from, date_to, mime, sort_desc, page, page_size),
+							search_files(
+								peer,
+								name_query,
+								content_query,
+								date_from,
+								date_to,
+								replicas_min,
+								replicas_max,
+								mime,
+								sort_desc,
+								page,
+								page_size,
+							),
 							GuiMessage::FileSearchLoaded,
 						);
 					}
 				}
 				Command::none()
 			}
-			GuiMessage::FilesOpenFile { node_id, path, mime } => {
+			GuiMessage::FilesOpenFile {
+				node_id,
+				path,
+				mime,
+			} => {
 				// Get current FileSearch state from active tab or mode
 				let files_state = if let Some(active_id) = self.active_tab_id {
 					self.tabs
@@ -2622,12 +2810,8 @@ impl Application for GuiApp {
 					);
 
 					// Create a new tab for the file viewer
-					let viewer_state = FileViewerState::from_files(
-						files_snapshot,
-						peer_id,
-						path,
-						mime,
-					);
+					let viewer_state =
+						FileViewerState::from_files(files_snapshot, peer_id, path, mime);
 					let tab_id = self.next_tab_id;
 					self.next_tab_id += 1;
 					let tab = Tab::file_viewer(tab_id, viewer_state.clone());
@@ -2904,16 +3088,13 @@ impl Application for GuiApp {
 			GuiMessage::StorageUsageOpenFile { node_id, path } => {
 				// Get storage state from active tab or self.mode
 				let storage_state = if let Some(active_id) = self.active_tab_id {
-					self.tabs
-						.iter()
-						.find(|t| t.id == active_id)
-						.and_then(|t| {
-							if let Mode::StorageUsage(state) = &t.mode {
-								Some(state.clone())
-							} else {
-								None
-							}
-						})
+					self.tabs.iter().find(|t| t.id == active_id).and_then(|t| {
+						if let Mode::StorageUsage(state) = &t.mode {
+							Some(state.clone())
+						} else {
+							None
+						}
+					})
 				} else if let Mode::StorageUsage(state) = &self.mode {
 					Some(state.clone())
 				} else {
@@ -2932,11 +3113,8 @@ impl Application for GuiApp {
 							result,
 						},
 					);
-					let viewer_state = FileViewerState::from_storage(
-						storage_snapshot,
-						node_id,
-						path,
-					);
+					let viewer_state =
+						FileViewerState::from_storage(storage_snapshot, node_id, path);
 					// Update both self.mode and active tab's mode
 					self.mode = Mode::FileViewer(viewer_state.clone());
 					if let Some(active_id) = self.active_tab_id {
@@ -2954,7 +3132,9 @@ impl Application for GuiApp {
 				if let Mode::FileBrowser(state) = &mut self.mode {
 					match result {
 						Ok(thumb) => {
-							state.thumbnails.insert(path, ThumbnailState::Loaded(thumb.data));
+							state
+								.thumbnails
+								.insert(path, ThumbnailState::Loaded(thumb.data));
 						}
 						Err(_) => {
 							state.thumbnails.insert(path, ThumbnailState::Failed);
@@ -2967,7 +3147,9 @@ impl Application for GuiApp {
 				if let Some(state) = self.active_file_search_mut() {
 					match result {
 						Ok(thumb) => {
-							state.thumbnails.insert(key, ThumbnailState::Loaded(thumb.data));
+							state
+								.thumbnails
+								.insert(key, ThumbnailState::Loaded(thumb.data));
 						}
 						Err(_) => {
 							state.thumbnails.insert(key, ThumbnailState::Failed);
@@ -3045,7 +3227,10 @@ impl Application for GuiApp {
 						self.active_update = None;
 					}
 					UpdateProgress::AlreadyUpToDate { current_version } => {
-						self.status = format!("Peer {} is already up to date (version {})", peer_id, current_version);
+						self.status = format!(
+							"Peer {} is already up to date (version {})",
+							peer_id, current_version
+						);
 						self.active_update = None;
 					}
 				}
@@ -3111,13 +3296,9 @@ impl Application for GuiApp {
 				self.status = format!("Opening file browser for {}...", peer_id);
 				// Load disks for the file browser
 				let peer = self.peer.clone();
-				Command::perform(
-					list_disks(peer, peer_id),
-					|(peer_id, disks)| GuiMessage::FileBrowserDisksLoaded {
-						peer_id,
-						disks,
-					},
-				)
+				Command::perform(list_disks(peer, peer_id), |(peer_id, disks)| {
+					GuiMessage::FileBrowserDisksLoaded { peer_id, disks }
+				})
 			}
 		}
 	}
@@ -3140,8 +3321,7 @@ impl Application for GuiApp {
 			if current_menu == *item {
 				label = format!("▶ {}", label);
 			}
-			let button = button(text(label).size(16))
-				.on_press(GuiMessage::MenuSelected(*item));
+			let button = button(text(label).size(16)).on_press(GuiMessage::MenuSelected(*item));
 			menu_column = menu_column.push(button);
 		}
 		let sidebar = container(menu_column)
@@ -3313,8 +3493,7 @@ impl GuiApp {
 	}
 
 	fn refresh_from_state(&mut self) {
-		if let Ok(state_guard) = self.peer.state().lock() {
-			let snapshot = state_guard.clone();
+		if let Some(snapshot) = self.peer.state_snapshot() {
 			self.local_peer_id = Some(snapshot.me.to_string());
 			self.peers = aggregate_peers(&snapshot);
 			if self
@@ -3476,7 +3655,11 @@ impl GuiApp {
 			let mut shared = iced::widget::Column::new().spacing(6);
 			shared = shared.push(text("Shared folders on this node (quick add)").size(16));
 			for folder in &state.shared_roots {
-				let access = if folder.write { "read/write" } else { "read-only" };
+				let access = if folder.write {
+					"read/write"
+				} else {
+					"read-only"
+				};
 				let mut add_btn = button(text("Add")).padding(6);
 				if !saving {
 					let path = folder.path.clone();
@@ -3626,7 +3809,11 @@ impl GuiApp {
 			add_button = add_button.on_press(GuiMessage::AccessRequestAddFolder);
 		}
 		controls = controls.push(add_button);
-		let mut request_button = button(text(if saving { "Requesting..." } else { "Send request" }));
+		let mut request_button = button(text(if saving {
+			"Requesting..."
+		} else {
+			"Send request"
+		}));
 		if !saving {
 			request_button = request_button.on_press(GuiMessage::AccessRequestSubmitted);
 		}
@@ -3805,7 +3992,9 @@ impl GuiApp {
 					let is_image = FileBrowserState::is_image_entry(entry);
 
 					// Create the content row
-					let mut row = iced::widget::Row::new().spacing(8).align_items(iced::Alignment::Center);
+					let mut row = iced::widget::Row::new()
+						.spacing(8)
+						.align_items(iced::Alignment::Center);
 
 					// Add thumbnail for images if available
 					if is_image {
@@ -3965,7 +4154,9 @@ impl GuiApp {
 		} else {
 			let mut list = iced::widget::Column::new().spacing(6);
 			for user in &state.users {
-				let row = iced::widget::Row::new().spacing(8).push(text(user).size(16));
+				let row = iced::widget::Row::new()
+					.spacing(8)
+					.push(text(user).size(16));
 				list = list.push(container(row).padding(8).style(theme::Container::Box));
 			}
 			layout = layout.push(scrollable(list).height(Length::Fill));
@@ -4071,6 +4262,21 @@ impl GuiApp {
 			);
 		layout = layout.push(search_row2);
 
+		// Replica count filters
+		let search_row3 = iced::widget::Row::new()
+			.spacing(12)
+			.push(
+				text_input("Replicas >= (optional)", &state.replicas_min)
+					.on_input(GuiMessage::FilesReplicasMinChanged)
+					.width(Length::FillPortion(1)),
+			)
+			.push(
+				text_input("Replicas <= (optional)", &state.replicas_max)
+					.on_input(GuiMessage::FilesReplicasMaxChanged)
+					.width(Length::FillPortion(1)),
+			);
+		layout = layout.push(search_row3);
+
 		// Sort toggle and search button
 		let sort_label = if state.sort_desc {
 			"Sort: Latest desc"
@@ -4119,13 +4325,21 @@ impl GuiApp {
 					let row = iced::widget::Row::new()
 						.spacing(8)
 						.push(text(display_name).size(14).width(Length::FillPortion(3)))
-						.push(text(format_size(entry.size)).size(14).width(Length::FillPortion(1)))
+						.push(
+							text(format_size(entry.size))
+								.size(14)
+								.width(Length::FillPortion(1)),
+						)
 						.push(
 							text(entry.mime_type.clone().unwrap_or_else(|| "?".into()))
 								.size(14)
 								.width(Length::FillPortion(2)),
 						)
-						.push(text(entry.replicas.to_string()).size(14).width(Length::FillPortion(1)))
+						.push(
+							text(entry.replicas.to_string())
+								.size(14)
+								.width(Length::FillPortion(1)),
+						)
 						.push(text(&entry.first).size(14).width(Length::FillPortion(2)))
 						.push(text(&entry.latest).size(14).width(Length::FillPortion(2)));
 
@@ -4218,15 +4432,13 @@ impl GuiApp {
 										.height(Length::Fixed(THUMBNAIL_SIZE))
 										.into()
 								}
-								Some(ThumbnailState::Loading) => {
-									container(text("...").size(14))
-										.width(Length::Fixed(THUMBNAIL_SIZE))
-										.height(Length::Fixed(THUMBNAIL_SIZE))
-										.align_x(Horizontal::Center)
-										.align_y(Vertical::Center)
-										.style(theme::Container::Box)
-										.into()
-								}
+								Some(ThumbnailState::Loading) => container(text("...").size(14))
+									.width(Length::Fixed(THUMBNAIL_SIZE))
+									.height(Length::Fixed(THUMBNAIL_SIZE))
+									.align_x(Horizontal::Center)
+									.align_y(Vertical::Center)
+									.style(theme::Container::Box)
+									.into(),
 								Some(ThumbnailState::Failed) | None => {
 									container(text("?").size(14))
 										.width(Length::Fixed(THUMBNAIL_SIZE))
@@ -4239,7 +4451,10 @@ impl GuiApp {
 							}
 						} else {
 							// Non-image file placeholder showing mime type
-							let mime_label = entry.mime_type.clone().unwrap_or_else(|| "file".to_string());
+							let mime_label = entry
+								.mime_type
+								.clone()
+								.unwrap_or_else(|| "file".to_string());
 							let short_mime = mime_label.split('/').last().unwrap_or(&mime_label);
 							container(text(short_mime).size(12))
 								.width(Length::Fixed(THUMBNAIL_SIZE))
@@ -4271,13 +4486,14 @@ impl GuiApp {
 							.padding(4)
 							.align_x(Horizontal::Center);
 
-						let item_button = button(item_container)
-							.padding(0)
-							.on_press(GuiMessage::FilesOpenFile {
-								node_id: entry.node_id.clone(),
-								path: entry.path.clone(),
-								mime: entry.mime_type.clone(),
-							});
+						let item_button =
+							button(item_container)
+								.padding(0)
+								.on_press(GuiMessage::FilesOpenFile {
+									node_id: entry.node_id.clone(),
+									path: entry.path.clone(),
+									mime: entry.mime_type.clone(),
+								});
 
 						current_row = current_row.push(item_button);
 						items_in_row += 1;
@@ -4303,7 +4519,8 @@ impl GuiApp {
 				}
 
 				// Pagination controls (same as table view)
-				let total_pages = (state.total_count + state.page_size - 1) / state.page_size.max(1);
+				let total_pages =
+					(state.total_count + state.page_size - 1) / state.page_size.max(1);
 				let start = state.page * state.page_size + 1;
 				let end = (start + state.results.len()).saturating_sub(1);
 				let page_info = format!(
@@ -4358,7 +4575,8 @@ impl GuiApp {
 		}
 		controls = controls.push(scan_btn);
 		if state.scanning {
-			controls = controls.push(button(text("Stop scan")).on_press(GuiMessage::ScanCancelRequested));
+			controls =
+				controls.push(button(text("Stop scan")).on_press(GuiMessage::ScanCancelRequested));
 		}
 		controls = controls.push(
 			button(text("View scan results"))
@@ -5012,11 +5230,17 @@ async fn wait_for_scan_event(receiver: Arc<Mutex<mpsc::Receiver<ScanEvent>>>) ->
 	}
 }
 
-async fn wait_for_update_event(receiver: Arc<Mutex<mpsc::Receiver<UpdateProgress>>>) -> UpdateProgress {
+async fn wait_for_update_event(
+	receiver: Arc<Mutex<mpsc::Receiver<UpdateProgress>>>,
+) -> UpdateProgress {
 	match task::spawn_blocking(move || receiver.lock().unwrap().recv()).await {
 		Ok(Ok(event)) => event,
-		Ok(Err(_)) => UpdateProgress::Failed { error: String::from("Update worker stopped") },
-		Err(err) => UpdateProgress::Failed { error: format!("Update wait failed: {err}") },
+		Ok(Err(_)) => UpdateProgress::Failed {
+			error: String::from("Update worker stopped"),
+		},
+		Err(err) => UpdateProgress::Failed {
+			error: format!("Update wait failed: {err}"),
+		},
 	}
 }
 
@@ -5026,6 +5250,8 @@ async fn search_files(
 	_content_query: String,
 	date_from: String,
 	date_to: String,
+	replicas_min: Option<u64>,
+	replicas_max: Option<u64>,
 	mime: Option<String>,
 	sort_desc: bool,
 	page: usize,
@@ -5048,6 +5274,8 @@ async fn search_files(
 		} else {
 			Some(date_to)
 		},
+		replicas_min,
+		replicas_max,
 		mime_type: mime,
 		sort_desc,
 		page,
@@ -5056,8 +5284,9 @@ async fn search_files(
 
 	// Build a map from truncated node_id (first 16 bytes) to full PeerId
 	let peer_map: HashMap<Vec<u8>, PeerId> = {
-		let state_arc = peer.state();
-		let state = state_arc.lock().map_err(|e| e.to_string())?;
+		let state = peer
+			.state_snapshot()
+			.ok_or_else(|| String::from("state unavailable"))?;
 		let mut peers = vec![state.me];
 		peers.extend(state.connections.iter().map(|c| c.peer_id));
 		peers.extend(state.discovered_peers.iter().map(|d| d.peer_id));
@@ -5124,8 +5353,8 @@ async fn load_scan_results_page(
 			let hash = row.hash.iter().map(|b| format!("{:02x}", b)).collect();
 			FileSearchEntry {
 				hash,
-				name: String::new(), // TODO: populate from database
-				path: String::new(), // TODO: populate from database
+				name: String::new(),    // TODO: populate from database
+				path: String::new(),    // TODO: populate from database
 				node_id: String::new(), // TODO: populate from database
 				size: row.size,
 				mime_type: row.mime_type,
@@ -5144,8 +5373,9 @@ async fn load_storage_usage(peer: Arc<PuppyNet>) -> Result<Vec<StorageNodeView>,
 		.await
 		.map_err(|err| err.to_string())?;
 	let known_peers: Vec<PeerId> = {
-		let state_arc = peer.state();
-		let state = state_arc.lock().map_err(|e| e.to_string())?;
+		let state = peer
+			.state_snapshot()
+			.ok_or_else(|| String::from("state unavailable"))?;
 		let mut peers = vec![state.me];
 		peers.extend(state.connections.iter().map(|c| c.peer_id));
 		peers.extend(state.discovered_peers.iter().map(|d| d.peer_id));
@@ -5154,7 +5384,10 @@ async fn load_storage_usage(peer: Arc<PuppyNet>) -> Result<Vec<StorageNodeView>,
 	Ok(build_storage_nodes(files, &known_peers))
 }
 
-fn build_storage_nodes(files: Vec<StorageUsageFile>, known_peers: &[PeerId]) -> Vec<StorageNodeView> {
+fn build_storage_nodes(
+	files: Vec<StorageUsageFile>,
+	known_peers: &[PeerId],
+) -> Vec<StorageNodeView> {
 	// Build a map from truncated node_id (first 16 bytes) to full PeerId
 	let peer_map: HashMap<Vec<u8>, PeerId> = known_peers
 		.iter()
@@ -5385,11 +5618,9 @@ mod tests {
 			set_keypair_var(&key_path);
 			let (mut app, _) = GuiApp::new(String::from("Test Title"));
 			let new_peer = PeerId::random();
-			{
-				let state = app.peer.state();
-				let mut guard = state.lock().expect("state lock");
-				guard.peer_discovered(new_peer, "/ip4/127.0.0.1/tcp/7000".parse().unwrap());
-			}
+			app.peer
+				.inject_discovered_peer(new_peer, "/ip4/127.0.0.1/tcp/7000".parse().unwrap())
+				.expect("inject peer");
 			app.peers.clear();
 			let _ = app.update(GuiMessage::MenuSelected(MenuItem::Peers));
 			assert!(matches!(app.mode, Mode::Peers));

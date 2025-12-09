@@ -29,10 +29,10 @@ use uuid::Uuid;
 
 use crate::db::FileEntry;
 use crate::scan::{ScanEvent, ScanResult};
+use crate::state::{FLAG_READ, FLAG_SEARCH, FLAG_WRITE, FolderRule, Permission, Rule};
 use crate::types::FileChunk;
 use crate::updater::UpdateProgress;
 use crate::wait_group::WaitGroupGuard;
-use crate::state::{FolderRule, Permission, Rule, FLAG_READ, FLAG_SEARCH, FLAG_WRITE};
 
 const PUPPYNET_PROTOCOL: &str = "/puppynet/0.0.1";
 const MAX_FILE_CHUNK: u64 = 4 * 1024 * 1024; // 4 MiB per transfer chunk
@@ -387,39 +387,6 @@ fn write_file_range(path: &str, offset: u64, data: &[u8]) -> Result<FileWriteAck
 	Ok(FileWriteAck {
 		bytes_written: data.len() as u64,
 	})
-}
-
-fn collect_disk_info() -> Result<Vec<DiskInfo>, String> {
-	let disks = Disks::new_with_refreshed_list();
-	let infos = disks
-		.list()
-		.iter()
-		.map(|disk| {
-			let total_space = disk.total_space();
-			let available_space = disk.available_space();
-			let usage_percent = if total_space == 0 {
-				0.0
-			} else {
-				let used = total_space.saturating_sub(available_space);
-				((used as f64 / total_space as f64) * 100.0) as f32
-			};
-			let usage = disk.usage();
-			DiskInfo {
-				name: disk.name().to_string_lossy().to_string(),
-				mount_path: disk.mount_point().to_string_lossy().to_string(),
-				filesystem: disk.file_system().to_string_lossy().to_string(),
-				total_space,
-				available_space,
-				usage_percent,
-				total_read_bytes: usage.total_read_bytes,
-				total_written_bytes: usage.total_written_bytes,
-				read_only: disk.is_read_only(),
-				removable: disk.is_removable(),
-				kind: format!("{:?}", disk.kind()),
-			}
-		})
-		.collect();
-	Ok(infos)
 }
 
 #[derive(Debug, Clone)]
