@@ -26,6 +26,7 @@ pub enum Command {
 	Uninstall,
 	Update { version: Option<String> },
 	Tui,
+	#[cfg(feature = "iced")]
 	Gui,
 	Daemon,
 }

@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 mod args;
+#[cfg(feature = "iced")]
 mod gui;
 mod installer;
 mod shell;
@@ -59,6 +60,7 @@ async fn main() {
 			}
 			return;
 		}
+		#[cfg(feature = "iced")]
 		Some(Command::Gui) => {
 			let app_title = format!("PuppyNet v{}", version_label);
 			if let Err(err) = gui::run(app_title) {
