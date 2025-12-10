@@ -261,3 +261,100 @@ form button {
 	background: #0f172a;
 	color: #e2e8f0
 }
+.preview-image {
+	margin-top: 12px;
+	display: flex;
+	justify-content: center;
+	background: #0f172a;
+	border: 1px solid #334155;
+	border-radius: 8px;
+	padding: 8px
+}
+
+.preview-image img {
+	max-width: 100%;
+	border-radius: 6px
+}
+
+.preview-text {
+	margin-top: 10px;
+	max-height: 320px;
+	overflow: auto;
+	background: #0f172a;
+	border: 1px solid #334155;
+	border-radius: 8px;
+	padding: 10px;
+	white-space: pre-wrap;
+	color: #e2e8f0
+}
+
+.modal {
+	position: fixed;
+	inset: 0;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	z-index: 999;
+}
+
+.modal.hidden {
+	display: none
+}
+
+.modal-backdrop {
+	position: absolute;
+	inset: 0;
+	background: rgba(15, 23, 42, .8);
+	backdrop-filter: blur(2px)
+}
+
+.modal-dialog {
+	position: relative;
+	background: #0f172a;
+	border: 1px solid #334155;
+	border-radius: 12px;
+	padding: 16px;
+	max-width: 90%;
+	max-height: 80%;
+	overflow: auto;
+	box-shadow: 0 12px 40px rgba(0, 0, 0, .45);
+	width: min(720px, 90vw)
+}
+
+.modal-close {
+	position: absolute;
+	top: 8px;
+	right: 8px;
+	border: 1px solid #334155;
+	background: #1e293b;
+	color: #e2e8f0;
+	border-radius: 999px;
+	width: 32px;
+	height: 32px;
+	cursor: pointer;
+	font-size: 18px;
+	line-height: 1
+}
+
+.preview-heading {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 12px;
+	margin-bottom: 10px
+}
+
+.button {
+	padding: 8px 12px;
+	border-radius: 8px;
+	border: 1px solid #38bdf8;
+	background: #0ea5e9;
+	color: #0b1728;
+	cursor: pointer
+}
+
+.button-ghost {
+	background: transparent;
+	color: #e2e8f0;
+	border-color: #334155
+}

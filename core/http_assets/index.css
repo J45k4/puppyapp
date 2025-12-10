@@ -257,3 +257,101 @@ form button {
   margin-bottom: 8px;
   padding: 6px 8px;
 }
+
+.preview-image {
+  display: flex;
+  background: #0f172a;
+  border: 1px solid #334155;
+  border-radius: 8px;
+  justify-content: center;
+  margin-top: 12px;
+  padding: 8px;
+}
+
+.preview-image img {
+  border-radius: 6px;
+  max-width: 100%;
+}
+
+.preview-text {
+  overflow: auto;
+  white-space: pre-wrap;
+  color: #e2e8f0;
+  background: #0f172a;
+  border: 1px solid #334155;
+  border-radius: 8px;
+  max-height: 320px;
+  margin-top: 10px;
+  padding: 10px;
+}
+
+.modal {
+  position: fixed;
+  display: flex;
+  z-index: 999;
+  justify-content: center;
+  align-items:  center;
+  inset: 0;
+}
+
+.modal.hidden {
+  display: none;
+}
+
+.modal-backdrop {
+  position: absolute;
+  backdrop-filter: blur(2px);
+  background: #0f172acc;
+  inset: 0;
+}
+
+.modal-dialog {
+  position: relative;
+  overflow: auto;
+  background: #0f172a;
+  border: 1px solid #334155;
+  border-radius: 12px;
+  width: min(720px, 90vw);
+  max-width: 90%;
+  max-height: 80%;
+  padding: 16px;
+  box-shadow: 0 12px 40px #00000073;
+}
+
+.modal-close {
+  position: absolute;
+  color: #e2e8f0;
+  cursor: pointer;
+  background: #1e293b;
+  border: 1px solid #334155;
+  border-radius: 999px;
+  width: 32px;
+  height: 32px;
+  font-size: 18px;
+  line-height: 1;
+  top: 8px;
+  right: 8px;
+}
+
+.preview-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items:  center;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.button {
+  color: #0b1728;
+  cursor: pointer;
+  background: #0ea5e9;
+  border: 1px solid #38bdf8;
+  border-radius: 8px;
+  padding: 8px 12px;
+}
+
+.button-ghost {
+  color: #e2e8f0;
+  background: none;
+  border-color: #334155;
+}

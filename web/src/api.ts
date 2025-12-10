@@ -14,6 +14,8 @@ export type SearchResult = {
 	hash: number[] | string
 	name: string
 	path: string
+	node_id?: number[]
+	peer_id?: string | null
 	size: number
 	mime_type?: string | null
 	replicas: number
@@ -82,4 +84,65 @@ export const searchFiles = async (
 		total: data.total ?? 0,
 		mime_types: data.mime_types ?? [],
 	}
+}
+
+export type FileChunk = {
+	offset: number
+	data: number[]
+	eof: boolean
+}
+
+export const fetchFileChunk = async (
+	peerId: string,
+	path: string,
+	offset = 0,
+	length = 65536,
+): Promise<FileChunk> => {
+	const params = new URLSearchParams()
+	params.set("path", path)
+	params.set("offset", String(offset))
+	params.set("length", String(length))
+	const res = await fetch(`${apiBase}/api/peers/${encodeURIComponent(peerId)}/file?${params.toString()}`)
+	if (!res.ok) throw new Error(`File fetch failed: ${res.status}`)
+	return res.json()
+}
+
+export const fetchWholeFile = async (
+	peerId: string,
+	path: string,
+	chunkSize = 65536,
+): Promise<Uint8Array> => {
+	let offset = 0
+	const parts: Uint8Array[] = []
+	let total = 0
+	while (true) {
+		const chunk = await fetchFileChunk(peerId, path, offset, chunkSize)
+		const bytes = new Uint8Array(chunk.data)
+		parts.push(bytes)
+		total += bytes.length
+		offset += bytes.length
+		if (chunk.eof || bytes.length === 0) break
+	}
+	const merged = new Uint8Array(total)
+	let pos = 0
+	for (const part of parts) {
+		merged.set(part, pos)
+		pos += part.length
+	}
+	return merged
+}
+
+export const fetchThumbnail = async (
+	peerId: string,
+	path: string,
+	maxWidth = 512,
+	maxHeight = 512,
+): Promise<Blob> => {
+	const params = new URLSearchParams()
+	params.set("path", path)
+	params.set("max_width", String(maxWidth))
+	params.set("max_height", String(maxHeight))
+	const res = await fetch(`${apiBase}/api/peers/${encodeURIComponent(peerId)}/thumbnail?${params.toString()}`)
+	if (!res.ok) throw new Error(`Thumbnail fetch failed: ${res.status}`)
+	return res.blob()
 }

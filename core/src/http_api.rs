@@ -13,8 +13,8 @@ use libp2p::PeerId;
 use mime_guess::from_path;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::borrow::Cow;
 use std::collections::HashMap;
+use std::borrow::Cow;
 use std::convert::Infallible;
 use std::fs;
 use std::net::SocketAddr;
@@ -85,6 +85,20 @@ struct UserSummary {
 struct SharedFolderSummary {
 	path: String,
 	flags: u8,
+}
+
+#[derive(Serialize)]
+struct SearchResultWithPeer {
+	hash: Vec<u8>,
+	name: String,
+	path: String,
+	node_id: Vec<u8>,
+	peer_id: Option<String>,
+	size: u64,
+	mime_type: Option<String>,
+	replicas: u64,
+	first_datetime: Option<String>,
+	latest_datetime: Option<String>,
 }
 
 struct ApiState {
@@ -195,6 +209,11 @@ fn parse_query(req: &Request<Body>) -> HashMap<String, String> {
 fn parse_peer_id(id: &str) -> Result<PeerId, String> {
 	PeerId::from_str(id).map_err(|e| format!("invalid peer id: {e}"))
 }
+
+fn peer_id_from_bytes(bytes: &[u8]) -> Option<String> {
+	PeerId::from_bytes(bytes).ok().map(|p| p.to_string())
+}
+
 
 #[cfg(not(debug_assertions))]
 fn load_asset(name: &str) -> Option<Cow<'static, [u8]>> {
@@ -647,10 +666,27 @@ async fn handle_request(
 			};
 			let puppy = Arc::clone(&state.puppy);
 			match task::spawn_blocking(move || puppy.search_files(args)).await {
-				Ok(Ok((results, mimes, total))) => json_response(
-					StatusCode::OK,
-					json!({ "results": results, "mime_types": mimes, "total": total }),
-				),
+				Ok(Ok((results, mimes, total))) => {
+					let results: Vec<SearchResultWithPeer> = results
+						.into_iter()
+						.map(|row| SearchResultWithPeer {
+							hash: row.hash,
+							name: row.name,
+							path: row.path,
+							node_id: row.node_id.clone(),
+							peer_id: peer_id_from_bytes(&row.node_id),
+							size: row.size,
+							mime_type: row.mime_type,
+							replicas: row.replicas,
+							first_datetime: row.first_datetime,
+							latest_datetime: row.latest_datetime,
+						})
+						.collect();
+					json_response(
+						StatusCode::OK,
+						json!({ "results": results, "mime_types": mimes, "total": total }),
+					)
+				}
 				Ok(Err(err)) => bad_request(err),
 				Err(err) => bad_request(err.to_string()),
 			}
