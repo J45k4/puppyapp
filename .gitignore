@@ -5,3 +5,4 @@ workdir
 peer_keypair.bin
 .DS_Store
 puppynet.db
+puppynet.xml

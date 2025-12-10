@@ -1,0 +1,1 @@
+repomix --include "core,cli,web,readme.md,Cargo.toml" --output puppynet.xml
