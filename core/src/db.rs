@@ -159,6 +159,20 @@ const MIGRATIONS: &[Migration] = &[
 			);
 		",
 	},
+	Migration {
+		id: 20250312,
+		name: "sessions",
+		sql: r"
+			create table if not exists sessions (
+				token_hash blob primary key,
+				username text not null,
+				created_at integer not null,
+				expires_at integer not null,
+				foreign key(username) references users(username) on delete cascade
+			);
+			create index if not exists sessions_username on sessions(username);
+		",
+	},
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1071,6 +1085,77 @@ pub fn load_users(conn: &Connection) -> anyhow::Result<Vec<User>> {
 		users.push(user?);
 	}
 	Ok(users)
+}
+
+pub fn load_user(conn: &Connection, username: &str) -> anyhow::Result<Option<User>> {
+	let mut stmt =
+		conn.prepare("SELECT username, password FROM users WHERE username = ?1 LIMIT 1")?;
+	let mut rows = stmt.query(params![username])?;
+	if let Some(row) = rows.next()? {
+		return Ok(Some(User {
+			name: row.get(0)?,
+			passw: row.get(1)?,
+		}));
+	}
+	Ok(None)
+}
+
+pub fn save_session(
+	conn: &Connection,
+	token_hash: &[u8],
+	username: &str,
+	created_at: i64,
+	expires_at: i64,
+) -> anyhow::Result<()> {
+	conn.execute(
+		r#"
+		INSERT INTO sessions (token_hash, username, created_at, expires_at)
+		VALUES (?1, ?2, ?3, ?4)
+		ON CONFLICT(token_hash) DO UPDATE SET
+			username = excluded.username,
+			created_at = excluded.created_at,
+			expires_at = excluded.expires_at
+		"#,
+		params![token_hash, username, created_at, expires_at],
+	)?;
+	Ok(())
+}
+
+pub fn lookup_session_username(
+	conn: &Connection,
+	token_hash: &[u8],
+	now: i64,
+) -> anyhow::Result<Option<String>> {
+	let mut stmt = conn.prepare(
+		r#"
+		SELECT username, expires_at
+		FROM sessions
+		WHERE token_hash = ?1
+		LIMIT 1
+		"#,
+	)?;
+	let mut rows = stmt.query(params![token_hash])?;
+	if let Some(row) = rows.next()? {
+		let expires_at: i64 = row.get(1)?;
+		if expires_at < now {
+			let _ = conn.execute(
+				"DELETE FROM sessions WHERE token_hash = ?1",
+				params![token_hash],
+			)?;
+			return Ok(None);
+		}
+		let username: String = row.get(0)?;
+		return Ok(Some(username));
+	}
+	Ok(None)
+}
+
+pub fn delete_session(conn: &Connection, token_hash: &[u8]) -> anyhow::Result<()> {
+	conn.execute(
+		"DELETE FROM sessions WHERE token_hash = ?1",
+		params![token_hash],
+	)?;
+	Ok(())
 }
 
 /// Runs embedded database migrations.

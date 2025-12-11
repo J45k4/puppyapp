@@ -1,3 +1,4 @@
+use crate::auth;
 use anyhow::bail;
 use libp2p::{Multiaddr, PeerId, swarm::ConnectionId};
 use serde::{Deserialize, Serialize};
@@ -307,9 +308,10 @@ impl State {
 		if self.users.iter().any(|u| u.name == username) {
 			bail!("User already exists");
 		}
+		let passw = auth::hash_password(&password)?;
 		self.users.push(User {
 			name: username,
-			passw: password,
+			passw,
 		});
 		Ok(())
 	}

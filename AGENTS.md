@@ -8,3 +8,6 @@ tab_width = 4
 indent_style = tab
 
 dont modify readme unless given instruction to do that
+
+if you make changes you web you should run
+- bun run check in web folder

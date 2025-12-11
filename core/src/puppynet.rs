@@ -1,6 +1,8 @@
 use crate::app::{App, Command, ReadFileCmd};
+use crate::auth;
 use crate::db::{
-	StorageUsageFile, load_discovered_peers, load_peers, load_users, open_db, run_migrations,
+	StorageUsageFile, delete_session, load_discovered_peers, load_peers, load_user, load_users,
+	lookup_session_username, open_db, run_migrations, save_session,
 };
 use crate::p2p::{
 	CpuInfo, DirEntry, DiskInfo, InterfaceInfo, PermissionGrant, Thumbnail, grant_from_permission,
@@ -11,6 +13,7 @@ use crate::state::{Peer, FLAG_READ, FLAG_SEARCH, FLAG_WRITE, Permission, State};
 use crate::updater::{self, UpdateProgress};
 use crate::{FileChunk, FileEntry};
 use anyhow::{Result, anyhow, bail};
+use chrono::Utc;
 use futures::executor::block_on;
 use libp2p::PeerId;
 use rusqlite::{Connection as SqliteConnection, params};
@@ -250,6 +253,42 @@ impl PuppyNet {
 		let conn = self.db.lock().map_err(|err| format!("db lock poisoned: {err}"))?;
 		load_discovered_peers(&conn)
 			.map_err(|err| format!("failed to load discovered peers: {err}"))
+	}
+
+	pub fn verify_user_credentials(
+		&self,
+		username: &str,
+		password: &str,
+	) -> anyhow::Result<bool> {
+		let conn = self.db.lock().map_err(|err| anyhow!("db lock poisoned: {err}"))?;
+		let Some(user) = load_user(&conn, username)? else {
+			return Ok(false);
+		};
+		auth::verify_password(password, &user.passw)
+	}
+
+	pub fn save_session(
+		&self,
+		token_hash: &[u8],
+		username: &str,
+		ttl_secs: i64,
+	) -> anyhow::Result<()> {
+		let now = Utc::now().timestamp();
+		let expires_at = now.saturating_add(ttl_secs);
+		let mut conn = self.db.lock().map_err(|err| anyhow!("db lock poisoned: {err}"))?;
+		save_session(&mut *conn, token_hash, username, now, expires_at)?;
+		Ok(())
+	}
+
+	pub fn http_me(&self, token_hash: &[u8]) -> anyhow::Result<Option<String>> {
+		let conn = self.db.lock().map_err(|err| anyhow!("db lock poisoned: {err}"))?;
+		lookup_session_username(&conn, token_hash, Utc::now().timestamp())
+	}
+
+	pub fn drop_session(&self, token_hash: &[u8]) -> anyhow::Result<()> {
+		let mut conn = self.db.lock().map_err(|err| anyhow!("db lock poisoned: {err}"))?;
+		delete_session(&mut *conn, token_hash)?;
+		Ok(())
 	}
 
 	pub async fn list_dir(&self, peer: PeerId, path: impl Into<String>) -> Result<Vec<DirEntry>> {

@@ -25,6 +25,12 @@ pub enum Command {
 	Install,
 	Uninstall,
 	Update { version: Option<String> },
+	CreateUser {
+		#[clap(long)]
+		username: String,
+		#[clap(long)]
+		password: String,
+	},
 	Tui,
 	#[cfg(feature = "iced")]
 	Gui,

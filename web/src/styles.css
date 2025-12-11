@@ -8,12 +8,63 @@
 body {
 	background: #0f172a;
 	color: #e2e8f0;
-	padding: 24px
+	padding: 24px;
+	min-height: 100vh;
 }
 
 .page {
 	max-width: 1080px;
 	margin: 0 auto
+}
+
+.page.shell {
+	display: flex;
+	align-items: flex-start;
+	gap: 24px;
+	min-height: calc(100vh - 48px);
+}
+
+.nav {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	flex: 0 0 220px;
+	border-right: 1px solid #334155;
+	padding-right: 16px;
+}
+
+.nav a {
+	display: block;
+	padding: 8px 12px;
+	text-align: left;
+	color: #e2e8f0;
+	text-decoration: none;
+	border-radius: 8px;
+	border: 1px solid transparent;
+	transition: all .15s ease;
+}
+.nav a:hover {
+	border-color: #38bdf8;
+	background: rgba(56, 189, 248, .12);
+}
+.nav a.active {
+	border-color: #38bdf8;
+	background: rgba(56, 189, 248, .2);
+	color: #0b1728;
+}
+
+.shell-content {
+	flex: 1;
+}
+
+.page.login-page {
+	min-height: 100vh;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	margin: 0;
+	max-width: unset;
+	padding: 0;
 }
 
 .hero {
@@ -41,6 +92,26 @@ body {
 	margin-bottom: 12px
 }
 
+.login-card form {
+	display: flex;
+	flex-direction: column;
+	gap: 12px;
+}
+
+.login-card form input,
+.login-card form button {
+	width: 100%;
+}
+
+.login-card .login-status {
+	color: #f87171;
+	font-size: 20px;
+	font-weight: 600;
+	margin-top: 12px;
+	line-height: 1.4;
+	min-height: 24px;
+}
+
 #users {
 	margin-bottom: 12px
 }
@@ -54,59 +125,32 @@ body {
 	border-bottom: 1px solid #334155
 }
 
-form {
+.page.shell form {
 	display: flex;
 	gap: 8px;
-	flex-wrap: wrap
+	flex-wrap: wrap;
 }
 
-form input {
+.page.shell form input {
 	padding: 8px 10px;
 	border-radius: 6px;
 	border: 1px solid #334155;
 	background: #0f172a;
-	color: #e2e8f0
+	color: #e2e8f0;
 }
 
-form button {
+.page.shell form button {
 	padding: 8px 14px;
 	border-radius: 6px;
 	border: 1px solid #38bdf8;
 	background: #0ea5e9;
 	color: #0b1728;
-	cursor: pointer
+	cursor: pointer;
 }
 
 #status {
 	margin-top: 10px;
 	color: #38bdf8
-}
-
-.nav {
-	display: flex;
-	align-items: center;
-	gap: 12px;
-	margin-bottom: 16px
-}
-
-.nav a {
-	color: #e2e8f0;
-	text-decoration: none;
-	padding: 8px 12px;
-	border-radius: 8px;
-	border: 1px solid transparent;
-	transition: all .15s ease
-}
-
-.nav a:hover {
-	border-color: #38bdf8;
-	background: rgba(56, 189, 248, .12)
-}
-
-.nav a.active {
-	border-color: #38bdf8;
-	background: rgba(56, 189, 248, .2);
-	color: #0b1728
 }
 
 .table {

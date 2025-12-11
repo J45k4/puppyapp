@@ -53,6 +53,15 @@ async fn main() {
 			log::info!("update completed successfully");
 			return;
 		}
+		Some(Command::CreateUser { username, password }) => {
+			let peer = Arc::new(PuppyNet::new());
+			if let Err(err) = peer.create_user(username.clone(), password.clone()) {
+				log::error!("failed to create user {}: {err:?}", username);
+				std::process::exit(1);
+			}
+			log::info!("user {} created", username);
+			return;
+		}
 		Some(Command::Tui) => {
 			if let Err(err) = shell::run() {
 				log::error!("shell error: {err:?}");

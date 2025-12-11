@@ -7,6 +7,8 @@ import { renderSearch } from "./pages/search"
 import { renderStorage } from "./pages/storage"
 import { renderUpdates } from "./pages/updates"
 import { renderSettings } from "./pages/settings"
+import { renderUsers, renderUserDetail } from "./pages/users"
+import { renderLogin } from "./pages/login"
 
 const serverAddr = getServerAddr()
 
@@ -17,8 +19,13 @@ window.onload = () => {
 	}
 	routes({
 		"/": () => renderHome(),
+		"/login": () => renderLogin(),
 		"/peers": () => renderPeers(),
-		"/peers/:peerId": ({ peerId }) => renderPeerDetail(peerId),
+		"/peers/:peerId": ({ peerId }: { peerId: string }) =>
+			renderPeerDetail(peerId),
+		"/user": () => renderUsers(),
+		"/user/:userId": ({ userId }: { userId: string }) =>
+			renderUserDetail(userId),
 		"/files": () => renderFiles(),
 		"/search": () => renderSearch(),
 		"/storage": () => renderStorage(),

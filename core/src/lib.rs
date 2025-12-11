@@ -1,3 +1,4 @@
+pub mod auth;
 mod app;
 mod db;
 pub mod http_api;

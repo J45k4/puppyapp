@@ -1,6 +1,6 @@
 import { navigate } from "./router"
 
-export const ensureShell = (currentPath: string) => {
+const createRoot = () => {
 	let root = document.getElementById("app-root")
 	if (!root) {
 		document.body.innerHTML = ""
@@ -8,18 +8,24 @@ export const ensureShell = (currentPath: string) => {
 		root.id = "app-root"
 		document.body.appendChild(root)
 	}
+	return root
+}
+
+export const ensureShell = (currentPath: string) => {
+	const root = createRoot()
 	root.innerHTML = `
-<div class="page">
-	<nav class="nav">
-		<a href="/" data-route="/">Home</a>
-		<a href="/peers" data-route="/peers">Peers</a>
-		<a href="/files" data-route="/files">Files</a>
+<div class="page shell">
+		<nav class="nav">
+			<a href="/" data-route="/">Home</a>
+			<a href="/peers" data-route="/peers">Peers</a>
+			<a href="/user" data-route="/user">Users</a>
+			<a href="/files" data-route="/files">Files</a>
 		<a href="/search" data-route="/search">Search</a>
 		<a href="/storage" data-route="/storage">Storage</a>
 		<a href="/updates" data-route="/updates">Updates</a>
 		<a href="/settings" data-route="/settings">Settings</a>
 	</nav>
-	<main id="content"></main>
+	<main id="content" class="shell-content"></main>
 </div>
 `
 	const navLinks = root.querySelectorAll<HTMLAnchorElement>(".nav a")
@@ -37,6 +43,18 @@ export const ensureShell = (currentPath: string) => {
 			if (href) navigate(href)
 		})
 	})
+	const content = root.querySelector<HTMLElement>("#content")
+	if (!content) throw new Error("content mount missing")
+	return content
+}
+
+export const ensureLoginShell = () => {
+	const root = createRoot()
+	root.innerHTML = `
+<div class="page login-page">
+	<main id="content"></main>
+</div>
+`
 	const content = root.querySelector<HTMLElement>("#content")
 	if (!content) throw new Error("content mount missing")
 	return content

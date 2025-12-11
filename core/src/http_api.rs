@@ -1,3 +1,4 @@
+use crate::auth;
 use crate::puppynet::PuppyNet;
 use crate::scan::ScanEvent;
 use crate::updater::UpdateProgress;
@@ -5,7 +6,8 @@ use crate::{Permission, SearchFilesArgs};
 use anyhow::Result;
 use hyper::body::Buf;
 use hyper::header::{
-	ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
+	ACCESS_CONTROL_ALLOW_CREDENTIALS, ACCESS_CONTROL_ALLOW_HEADERS,
+	ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue, ORIGIN, SET_COOKIE,
 };
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Method, Request, Response, Server, StatusCode};
@@ -16,22 +18,35 @@ use serde_json::json;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::env;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use log::warn;
+use rand::rngs::OsRng;
+use rand::RngCore;
 use tokio::{signal, task};
 use tokio::net::TcpListener;
 use url::form_urlencoded;
 
 const CT_JSON: &str = "application/json";
+const SESSION_COOKIE: &str = "sid";
+const SESSION_TTL_SECS: i64 = 60 * 60 * 24 * 7;
 
 #[derive(Deserialize)]
 struct CreateUserRequest {
 	username: String,
 	password: String,
+}
+
+#[derive(Deserialize)]
+struct LoginRequest {
+	username: String,
+	password: String,
+	set_cookie: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -93,16 +108,18 @@ struct ApiState {
 	next_scan_id: AtomicU64,
 	updates: Mutex<HashMap<u64, Arc<Mutex<std::sync::mpsc::Receiver<UpdateProgress>>>>>,
 	next_update_id: AtomicU64,
+	jwt_secret: String,
 }
 
 impl ApiState {
-	fn new(puppy: Arc<PuppyNet>) -> Self {
+	fn new(puppy: Arc<PuppyNet>, jwt_secret: String) -> Self {
 		Self {
 			puppy,
 			scans: Mutex::new(HashMap::new()),
 			next_scan_id: AtomicU64::new(1),
 			updates: Mutex::new(HashMap::new()),
 			next_update_id: AtomicU64::new(1),
+			jwt_secret,
 		}
 	}
 
@@ -196,6 +213,57 @@ fn parse_peer_id(id: &str) -> Result<PeerId, String> {
 	PeerId::from_str(id).map_err(|e| format!("invalid peer id: {e}"))
 }
 
+fn cookie_value(req: &Request<Body>, name: &str) -> Option<String> {
+	let raw = req.headers().get(hyper::header::COOKIE)?;
+	let header = raw.to_str().ok()?;
+	for part in header.split(';') {
+		let mut kv = part.trim().splitn(2, '=');
+		if let (Some(key), Some(value)) = (kv.next(), kv.next()) {
+			if key == name {
+				return Some(value.to_string());
+			}
+		}
+	}
+	None
+}
+
+fn session_cookie(token: &str, ttl_secs: i64) -> Option<HeaderValue> {
+	if ttl_secs <= 0 {
+		return None;
+	}
+	let cookie = format!(
+		"{}={}; HttpOnly; Path=/; Max-Age={}; SameSite=Lax",
+		SESSION_COOKIE, token, ttl_secs
+	);
+	HeaderValue::from_str(&cookie).ok()
+}
+
+fn clear_session_cookie() -> HeaderValue {
+	HeaderValue::from_static("sid=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax")
+}
+
+fn bearer_token(req: &Request<Body>) -> Option<String> {
+	let header = req.headers().get(hyper::header::AUTHORIZATION)?.to_str().ok()?;
+	let (kind, token) = header.split_once(' ')?;
+	kind.eq_ignore_ascii_case("bearer")
+		.then(|| token.to_string())
+}
+
+fn authenticate(req: &Request<Body>, state: &Arc<ApiState>) -> Option<String> {
+	if let Some(token) = bearer_token(req) {
+		if let Ok(claims) = auth::verify_jwt(&token, state.jwt_secret.as_bytes()) {
+			return Some(claims.sub);
+		}
+	}
+	if let Some(sid) = cookie_value(req, SESSION_COOKIE) {
+		let hash = auth::token_hash(&sid);
+		if let Ok(Some(username)) = state.puppy.http_me(&hash) {
+			return Some(username);
+		}
+	}
+	None
+}
+
 #[cfg(not(debug_assertions))]
 fn load_asset(name: &str) -> Option<Cow<'static, [u8]>> {
 	match name {
@@ -253,9 +321,13 @@ fn serve_static_path(path: &str) -> Option<Response<Body>> {
 	load_asset(path).map(|data| asset_response(path, data))
 }
 
-fn with_cors(mut resp: Response<Body>) -> Response<Body> {
+fn with_cors(mut resp: Response<Body>, origin: Option<&str>) -> Response<Body> {
+	let origin_value: HeaderValue = origin
+		.unwrap_or("*")
+		.parse()
+		.unwrap_or_else(|_| HeaderValue::from_static("*"));
 	resp.headers_mut()
-		.insert(ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().unwrap());
+		.insert(ACCESS_CONTROL_ALLOW_ORIGIN, origin_value);
 	resp.headers_mut().insert(
 		ACCESS_CONTROL_ALLOW_HEADERS,
 		"content-type,authorization".parse().unwrap(),
@@ -264,19 +336,54 @@ fn with_cors(mut resp: Response<Body>) -> Response<Body> {
 		ACCESS_CONTROL_ALLOW_METHODS,
 		"GET,POST,PUT,DELETE,OPTIONS".parse().unwrap(),
 	);
+	resp.headers_mut().insert(
+		ACCESS_CONTROL_ALLOW_CREDENTIALS,
+		HeaderValue::from_static("true"),
+	);
 	resp
+}
+
+fn load_jwt_secret() -> String {
+	if let Ok(value) = env::var("JWT_SECRET") {
+		let trimmed = value.trim();
+		if !trimmed.is_empty() {
+			return trimmed.to_string();
+		}
+	}
+	let mut bytes = [0u8; 32];
+	OsRng.fill_bytes(&mut bytes);
+	let fallback: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+	warn!("JWT_SECRET not set; using ephemeral secret");
+	fallback
 }
 
 async fn handle_request(
 	req: Request<Body>,
 	state: Arc<ApiState>,
 ) -> Result<Response<Body>, Infallible> {
+	let origin = req
+		.headers()
+		.get(ORIGIN)
+		.and_then(|v| v.to_str().ok())
+		.map(|v| v.to_string());
+	let origin_ref = origin.as_deref();
 	let segments: Vec<&str> = req
 		.uri()
 		.path()
 		.split('/')
 		.filter(|s| !s.is_empty())
 		.collect();
+	let is_protected = matches!(segments.as_slice(), ["api", ..]);
+	let auth_user = if is_protected || matches!(segments.as_slice(), ["auth", "me"]) {
+		authenticate(&req, &state)
+	} else {
+		None
+	};
+	if is_protected && req.method() != Method::OPTIONS && auth_user.is_none() {
+		let resp =
+			json_response(StatusCode::UNAUTHORIZED, json!({ "error": "not authenticated" }));
+		return Ok(with_cors(resp, origin_ref));
+	}
 
 	let response = match (req.method(), segments.as_slice()) {
 		(&Method::OPTIONS, _) => Response::builder()
@@ -284,6 +391,96 @@ async fn handle_request(
 			.body(Body::empty())
 			.unwrap(),
 		(&Method::GET, ["health"]) => Response::new(Body::from("ok")),
+		(&Method::POST, ["auth", "login"]) => {
+			let body = hyper::body::aggregate(req.into_body()).await;
+			let Ok(buf) = body else {
+				return Ok(with_cors(bad_request("failed to read body"), origin_ref));
+			};
+			let parsed: Result<LoginRequest, _> = serde_json::from_reader(buf.reader());
+			match parsed {
+				Ok(payload) => {
+					let creds_ok = match state
+						.puppy
+						.verify_user_credentials(&payload.username, &payload.password)
+					{
+						Ok(valid) => valid,
+						Err(err) => {
+							return Ok(with_cors(
+								json_response(
+									StatusCode::INTERNAL_SERVER_ERROR,
+									json!({ "error": err.to_string() }),
+								),
+								origin_ref,
+							));
+						}
+					};
+					if !creds_ok {
+						return Ok(with_cors(
+							json_response(
+								StatusCode::UNAUTHORIZED,
+								json!({ "error": "invalid credentials" }),
+							),
+							origin_ref,
+						));
+					}
+					let access_token = match auth::issue_jwt(
+						&payload.username,
+						state.jwt_secret.as_bytes(),
+					) {
+						Ok(token) => token,
+						Err(err) => {
+							return Ok(with_cors(
+								json_response(
+									StatusCode::INTERNAL_SERVER_ERROR,
+									json!({ "error": err.to_string() }),
+								),
+								origin_ref,
+							));
+						}
+					};
+					let mut resp =
+						json_response(StatusCode::OK, json!({ "access_token": access_token }));
+					if payload.set_cookie.unwrap_or(false) {
+						let (token, hash) = auth::generate_session_token();
+						if let Err(err) =
+							state.puppy.save_session(&hash, &payload.username, SESSION_TTL_SECS)
+						{
+							return Ok(with_cors(
+								json_response(
+									StatusCode::INTERNAL_SERVER_ERROR,
+									json!({ "error": err.to_string() }),
+								),
+								origin_ref,
+							));
+						}
+						if let Some(cookie) = session_cookie(&token, SESSION_TTL_SECS) {
+							resp.headers_mut().insert(SET_COOKIE, cookie);
+						}
+					}
+					resp
+				}
+				Err(err) => bad_request(format!("invalid json: {err}")),
+			}
+		}
+		(&Method::POST, ["auth", "logout"]) => {
+			if let Some(sid) = cookie_value(&req, SESSION_COOKIE) {
+				let hash = auth::token_hash(&sid);
+				let _ = state.puppy.drop_session(&hash);
+			}
+			let mut resp = Response::builder()
+				.status(StatusCode::NO_CONTENT)
+				.body(Body::empty())
+				.unwrap();
+			resp.headers_mut().insert(SET_COOKIE, clear_session_cookie());
+			resp
+		}
+		(&Method::GET, ["auth", "me"]) => match auth_user {
+			Some(user) => json_response(StatusCode::OK, json!({ "user": user })),
+			None => json_response(
+				StatusCode::UNAUTHORIZED,
+				json!({ "error": "not authenticated" }),
+			),
+		},
 		(&Method::GET, ["users"]) => {
 			match state.puppy.list_users_db() {
 				Ok(list) => json_response(StatusCode::OK, json!({ "users": list })),
@@ -296,7 +493,7 @@ async fn handle_request(
 		(&Method::POST, ["users"]) => {
 			let body = hyper::body::aggregate(req.into_body()).await;
 			let Ok(buf) = body else {
-				return Ok(bad_request("failed to read body"));
+				return Ok(with_cors(bad_request("failed to read body"), origin_ref));
 			};
 			let parsed: Result<CreateUserRequest, _> = serde_json::from_reader(buf.reader());
 			match parsed {
@@ -383,7 +580,7 @@ async fn handle_request(
 		(&Method::GET, ["api", "peers", peer_id, "permissions"]) => {
 			let peer = match parse_peer_id(peer_id) {
 				Ok(p) => p,
-				Err(err) => return Ok(bad_request(err)),
+				Err(err) => return Ok(with_cors(bad_request(err), origin_ref)),
 			};
 			match state.puppy.list_permissions(peer).await {
 				Ok(perms) => json_response(StatusCode::OK, json!({ "permissions": perms })),
@@ -393,7 +590,7 @@ async fn handle_request(
 		(&Method::GET, ["api", "peers", peer_id, "permissions", "granted"]) => {
 			let peer = match parse_peer_id(peer_id) {
 				Ok(p) => p,
-				Err(err) => return Ok(bad_request(err)),
+				Err(err) => return Ok(with_cors(bad_request(err), origin_ref)),
 			};
 			match state.puppy.list_granted_permissions(peer) {
 				Ok(perms) => json_response(StatusCode::OK, json!({ "permissions": perms })),
@@ -403,11 +600,11 @@ async fn handle_request(
 		(&Method::PUT, ["api", "peers", peer_id, "permissions"]) => {
 			let peer = match parse_peer_id(peer_id) {
 				Ok(p) => p,
-				Err(err) => return Ok(bad_request(err)),
+				Err(err) => return Ok(with_cors(bad_request(err), origin_ref)),
 			};
 			let body = hyper::body::aggregate(req.into_body()).await;
 			let Ok(buf) = body else {
-				return Ok(bad_request("failed to read body"));
+				return Ok(with_cors(bad_request("failed to read body"), origin_ref));
 			};
 			let parsed: Result<SetPermissionsRequest, _> =
 				serde_json::from_reader(buf.reader());
@@ -428,11 +625,11 @@ async fn handle_request(
 		(&Method::POST, ["api", "peers", peer_id, "permissions", "request"]) => {
 			let peer = match parse_peer_id(peer_id) {
 				Ok(p) => p,
-				Err(err) => return Ok(bad_request(err)),
+				Err(err) => return Ok(with_cors(bad_request(err), origin_ref)),
 			};
 			let body = hyper::body::aggregate(req.into_body()).await;
 			let Ok(buf) = body else {
-				return Ok(bad_request("failed to read body"));
+				return Ok(with_cors(bad_request("failed to read body"), origin_ref));
 			};
 			let parsed: Result<PermissionsRequest, _> = serde_json::from_reader(buf.reader());
 			match parsed {
@@ -450,7 +647,7 @@ async fn handle_request(
 		(&Method::GET, ["api", "peers", peer_id, "dir"]) => {
 			let peer = match parse_peer_id(peer_id) {
 				Ok(p) => p,
-				Err(err) => return Ok(bad_request(err)),
+				Err(err) => return Ok(with_cors(bad_request(err), origin_ref)),
 			};
 			let query = parse_query(&req);
 			let path = query.get("path").cloned().unwrap_or_else(|| "/".into());
@@ -462,7 +659,7 @@ async fn handle_request(
 		(&Method::GET, ["api", "peers", peer_id, "disks"]) => {
 			let peer = match parse_peer_id(peer_id) {
 				Ok(p) => p,
-				Err(err) => return Ok(bad_request(err)),
+				Err(err) => return Ok(with_cors(bad_request(err), origin_ref)),
 			};
 			match state.puppy.list_disks(peer).await {
 				Ok(disks) => json_response(StatusCode::OK, json!({ "disks": disks })),
@@ -472,7 +669,7 @@ async fn handle_request(
 		(&Method::GET, ["api", "peers", peer_id, "interfaces"]) => {
 			let peer = match parse_peer_id(peer_id) {
 				Ok(p) => p,
-				Err(err) => return Ok(bad_request(err)),
+				Err(err) => return Ok(with_cors(bad_request(err), origin_ref)),
 			};
 			match state.puppy.list_interfaces(peer).await {
 				Ok(interfaces) => {
@@ -484,7 +681,7 @@ async fn handle_request(
 		(&Method::GET, ["api", "peers", peer_id, "cpus"]) => {
 			let peer = match parse_peer_id(peer_id) {
 				Ok(p) => p,
-				Err(err) => return Ok(bad_request(err)),
+				Err(err) => return Ok(with_cors(bad_request(err), origin_ref)),
 			};
 			match state.puppy.list_cpus(peer).await {
 				Ok(cpus) => json_response(StatusCode::OK, json!({ "cpus": cpus })),
@@ -494,11 +691,11 @@ async fn handle_request(
 		(&Method::GET, ["api", "peers", peer_id, "file"]) => {
 			let peer = match parse_peer_id(peer_id) {
 				Ok(p) => p,
-				Err(err) => return Ok(bad_request(err)),
+				Err(err) => return Ok(with_cors(bad_request(err), origin_ref)),
 			};
 			let query = parse_query(&req);
 			let Some(path) = query.get("path") else {
-				return Ok(bad_request("missing path"));
+				return Ok(with_cors(bad_request("missing path"), origin_ref));
 			};
 			let offset = query
 				.get("offset")
@@ -517,11 +714,11 @@ async fn handle_request(
 		(&Method::GET, ["api", "peers", peer_id, "thumbnail"]) => {
 			let peer = match parse_peer_id(peer_id) {
 				Ok(p) => p,
-				Err(err) => return Ok(bad_request(err)),
+				Err(err) => return Ok(with_cors(bad_request(err), origin_ref)),
 			};
 			let query = parse_query(&req);
 			let Some(path) = query.get("path") else {
-				return Ok(bad_request("missing path"));
+				return Ok(with_cors(bad_request("missing path"), origin_ref));
 			};
 			let max_width = query
 				.get("max_width")
@@ -569,7 +766,7 @@ async fn handle_request(
 		(&Method::POST, ["api", "scans"]) => {
 			let body = hyper::body::aggregate(req.into_body()).await;
 			let Ok(buf) = body else {
-				return Ok(bad_request("failed to read body"));
+				return Ok(with_cors(bad_request("failed to read body"), origin_ref));
 			};
 			let parsed: Result<ScanStartRequest, _> = serde_json::from_reader(buf.reader());
 			match parsed {
@@ -585,7 +782,7 @@ async fn handle_request(
 		}
 		(&Method::GET, ["api", "scans", scan_id, "events"]) => {
 			let Ok(id) = scan_id.parse::<u64>() else {
-				return Ok(bad_request("invalid scan id"));
+				return Ok(with_cors(bad_request("invalid scan id"), origin_ref));
 			};
 			match state.poll_scan(id) {
 				Some(events) => json_response(StatusCode::OK, json!({ "events": events })),
@@ -594,7 +791,7 @@ async fn handle_request(
 		}
 		(&Method::POST, ["api", "scans", scan_id, "cancel"]) => {
 			let Ok(id) = scan_id.parse::<u64>() else {
-				return Ok(bad_request("invalid scan id"));
+				return Ok(with_cors(bad_request("invalid scan id"), origin_ref));
 			};
 			if state.cancel_scan(id) {
 				Response::builder()
@@ -666,11 +863,11 @@ async fn handle_request(
 		(&Method::POST, ["api", "updates", peer_id]) => {
 			let peer = match parse_peer_id(peer_id) {
 				Ok(p) => p,
-				Err(err) => return Ok(bad_request(err)),
+				Err(err) => return Ok(with_cors(bad_request(err), origin_ref)),
 			};
 			let body = hyper::body::aggregate(req.into_body()).await;
 			let Ok(buf) = body else {
-				return Ok(bad_request("failed to read body"));
+				return Ok(with_cors(bad_request("failed to read body"), origin_ref));
 			};
 			let parsed: Result<UpdateStartRequest, _> =
 				serde_json::from_reader(buf.reader());
@@ -687,7 +884,7 @@ async fn handle_request(
 		}
 		(&Method::GET, ["api", "updates", update_id, "events"]) => {
 			let Ok(id) = update_id.parse::<u64>() else {
-				return Ok(bad_request("invalid update id"));
+				return Ok(with_cors(bad_request("invalid update id"), origin_ref));
 			};
 			match state.poll_update(id) {
 				Some(events) => json_response(StatusCode::OK, json!({ "events": events })),
@@ -697,22 +894,23 @@ async fn handle_request(
 				),
 			}
 		}
-		(&Method::GET, segments) => {
-			let path = segments.join("/");
-			match serve_static_path(&path) {
-				Some(resp) => resp,
-				None => json_response(StatusCode::NOT_FOUND, json!({ "error": "not found" })),
-			}
+	(&Method::GET, segments) => {
+		let path = segments.join("/");
+		match serve_static_path(&path) {
+			Some(resp) => resp,
+			None => json_response(StatusCode::NOT_FOUND, json!({ "error": "not found" })),
 		}
-		_ => json_response(StatusCode::NOT_FOUND, json!({ "error": "not found" })),
+	}
+	_ => json_response(StatusCode::NOT_FOUND, json!({ "error": "not found" })),
 	};
 
-	Ok(with_cors(response))
+	Ok(with_cors(response, origin_ref))
 }
 
 /// Start a simple HTTP server exposing a small API surface on top of PuppyNet.
 pub async fn serve(puppy: Arc<PuppyNet>, addr: SocketAddr) -> Result<()> {
-	let state = Arc::new(ApiState::new(puppy));
+	let jwt_secret = load_jwt_secret();
+	let state = Arc::new(ApiState::new(puppy, jwt_secret));
 	let make_svc = make_service_fn(move |_| {
 		let state = Arc::clone(&state);
 		async move {

@@ -1,3 +1,4 @@
+use crate::auth;
 use crate::p2p::{
 	AuthMethod, CpuInfo, DirEntry, DiskInfo, FileWriteAck, InterfaceInfo, PeerReq, PeerRes,
 	PermissionGrant, Thumbnail, permission_from_grant,
@@ -918,12 +919,19 @@ impl App {
 			PeerReq::CreateUser {
 				username,
 				password,
-				roles,
-				permissions,
+				roles: _,
+				permissions: _,
 			} => {
+				let passw = match auth::hash_password(&password) {
+					Ok(hash) => hash,
+					Err(err) => {
+						log::error!("failed to hash password for {}: {}", username, err);
+						return Ok(PeerRes::Error("Failed to hash password".into()));
+					}
+				};
 				let user = User {
 					name: username.clone(),
-					passw: password.clone(),
+					passw,
 				};
 				if self.state.users.iter().any(|u| u.name == user.name) {
 					return Ok(PeerRes::Error("User already exists".into()));
@@ -1879,9 +1887,10 @@ impl App {
 					if self.state.users.iter().any(|u| u.name == username) {
 						bail!("User already exists");
 					}
+					let passw = auth::hash_password(&password)?;
 					let user = User {
 						name: username.clone(),
-						passw: password.clone(),
+						passw,
 					};
 					{
 						let mut conn = self.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
