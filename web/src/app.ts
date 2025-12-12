@@ -9,7 +9,7 @@ import { renderUpdates } from "./pages/updates"
 import { renderSettings } from "./pages/settings"
 import { renderUsers, renderUserDetail } from "./pages/users"
 import { renderLogin } from "./pages/login"
-import { renderFileByHash } from "./pages/file"
+import { renderFileByHash, renderFileByPath } from "./pages/file"
 
 const serverAddr = getServerAddr()
 
@@ -32,6 +32,12 @@ window.onload = () => {
 		"/storage": () => renderStorage(),
 		"/updates": () => renderUpdates(),
 		"/settings": () => renderSettings(),
+		"/file": () => {
+			const params = new URLSearchParams(window.location.search)
+			const peerId = params.get("peer") ?? ""
+			const path = params.get("path") ?? ""
+			return renderFileByPath(peerId, path)
+		},
 		"/file/:hash": ({ hash }: { hash: string }) => renderFileByHash(hash),
 		"/*": () => renderHome(),
 	})

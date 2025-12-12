@@ -1,6 +1,8 @@
 import { ensureShell } from "../layout"
 import { fetchLocalPeerId, fetchPeers, listPeerDir, listPeerDisks } from "../api"
 import type { DiskInfo, DirEntry, Peer } from "../api"
+import { createTreeView, type TreeNode } from "../treeview"
+import { navigate } from "../router"
 
 type BrowserState = {
 	peerId: string
@@ -122,6 +124,40 @@ export const renderFiles = async () => {
 		error: null,
 	}
 
+	const tree = createTreeView<DirEntry | DiskInfo>({
+		nodes: [],
+		className: "files-tree",
+		onSelect: (node) => {
+			if (state.loading) return
+			if (state.showingDisks) {
+				const disk = node.data as DiskInfo
+				state.showingDisks = false
+				state.path = disk.mount_path
+				state.entries = []
+				state.error = null
+				void loadBrowser()
+				return
+			}
+			const entry = node.data as DirEntry
+			const target = joinChildPath(state.path, entry.name)
+			if (entry.is_dir) {
+				state.showingDisks = false
+				state.path = target
+				state.entries = []
+				state.error = null
+				void loadBrowser()
+				return
+			}
+			const params = new URLSearchParams()
+			params.set("peer", state.peerId)
+			params.set("path", target)
+			navigate(`/file?${params.toString()}`)
+		},
+	})
+	if (browserEl) {
+		browserEl.appendChild(tree.element)
+	}
+
 	const updateControls = () => {
 		const disabled = state.loading
 		if (peerSelect) {
@@ -148,108 +184,70 @@ export const renderFiles = async () => {
 			browserEl.innerHTML = `<p class="muted">Loading ${
 				state.showingDisks ? "disks" : "directory"
 			}...</p>`
+			browserEl.appendChild(tree.element)
 			return
 		}
 		if (state.error) {
 			browserEl.innerHTML = `<p class="muted">Error: ${escapeHtml(
 				state.error,
 			)}</p>`
+			browserEl.appendChild(tree.element)
+			tree.setNodes([])
 			return
 		}
 
 		if (state.showingDisks) {
 			if (!state.disks.length) {
 				browserEl.innerHTML = `<p class="muted">No disks were reported for this peer.</p>`
+				browserEl.appendChild(tree.element)
+				tree.setNodes([])
 				return
 			}
-			const rows = state.disks
-				.map((disk) => {
-					const label = disk.name || disk.mount_path
-					return `
-					<div class="files-row">
-						<div>
-							<strong>${escapeHtml(label)}</strong>
-							<p class="muted">${escapeHtml(disk.mount_path)}</p>
-							<p>${formatSize(disk.available_space)} free of ${formatSize(
-						disk.total_space,
-					)}</p>
-						</div>
-						<button type="button" class="link-btn" data-disk-path="${escapeHtml(
-							disk.mount_path,
-						)}">Browse</button>
-					</div>
-				`
-				})
-				.join("")
-			browserEl.innerHTML = `<div class="files-list">${rows}</div>`
-			const diskButtons = browserEl.querySelectorAll<HTMLButtonElement>(
-				"[data-disk-path]",
-			)
-			diskButtons.forEach((btn) => {
-				btn.addEventListener("click", () => {
-					const diskPath = btn.dataset.diskPath
-					if (!diskPath) return
-					state.showingDisks = false
-					state.path = diskPath
-					state.entries = []
-					state.error = null
-					void loadBrowser()
-				})
+			const nodes: TreeNode<DiskInfo>[] = state.disks.map((disk) => {
+				const label = disk.name || disk.mount_path
+				return {
+					id: `disk:${disk.mount_path}`,
+					label: escapeHtml(label),
+					sublabel: escapeHtml(
+						`${disk.mount_path} • ${formatSize(
+							disk.available_space,
+						)} free of ${formatSize(disk.total_space)}`,
+					),
+					badge: "disk",
+					data: disk,
+				}
 			})
+			browserEl.innerHTML = ""
+			browserEl.appendChild(tree.element)
+			tree.setNodes(nodes)
 			return
 		}
 
 		if (!state.entries.length) {
 			browserEl.innerHTML = `<p class="muted">Directory is empty.</p>`
+			browserEl.appendChild(tree.element)
+			tree.setNodes([])
 			return
 		}
-		const rows = state.entries
-			.map((entry) => {
-				const label = entry.is_dir
-					? `[DIR] ${escapeHtml(entry.name)}`
-					: escapeHtml(entry.name)
-				const meta = entry.is_dir
-					? "Directory"
-					: `${entry.mime ?? "File"} • ${formatSize(entry.size)}`
-				return `
-				<button
-					type="button"
-					class="files-entry"
-					data-entry-name="${escapeHtml(entry.name)}"
-					data-entry-dir="${entry.is_dir ? "1" : "0"}"
-				>
-					<div>
-						<strong>${label}</strong>
-						<p class="muted">${meta}</p>
-					</div>
-					<span class="badge small">${entry.is_dir ? "dir" : "file"}</span>
-				</button>
-			`
-			})
-			.join("")
-		browserEl.innerHTML = `<div class="files-list">${rows}</div>`
-		const entryButtons = browserEl.querySelectorAll<HTMLButtonElement>(
-			"[data-entry-name]",
-		)
-		entryButtons.forEach((btn) => {
-			btn.addEventListener("click", () => {
-				const name = btn.dataset.entryName
-				if (!name) return
-				const isDir = btn.dataset.entryDir === "1"
-				const target = joinChildPath(state.path, name)
-				if (isDir) {
-					state.showingDisks = false
-					state.path = target
-					state.entries = []
-					state.error = null
-					void loadBrowser()
-					return
-				}
-				if (statusEl) {
-					statusEl.textContent = `Selected ${target}`
-				}
-			})
+		const sorted = [...state.entries].sort((a, b) => {
+			if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1
+			return a.name.localeCompare(b.name)
 		})
+		const nodes: TreeNode<DirEntry>[] = sorted.map((entry) => {
+			const meta = entry.is_dir
+				? "Directory"
+				: `${entry.mime ?? "File"} • ${formatSize(entry.size)}`
+			return {
+				id: joinChildPath(state.path, entry.name),
+				label: escapeHtml(entry.name),
+				sublabel: escapeHtml(meta),
+				badge: entry.is_dir ? "dir" : "file",
+				data: entry,
+			}
+		})
+		browserEl.innerHTML = ""
+		browserEl.appendChild(tree.element)
+		tree.setNodes(nodes)
 	}
 
 	const updateBrowserView = () => {

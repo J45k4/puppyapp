@@ -470,6 +470,95 @@ fn parse_range_header(value: &str, total: u64) -> Result<(u64, u64), RangeParseE
 	Ok((start, end))
 }
 
+fn parse_peer_range_header(
+	value: &str,
+	total: Option<u64>,
+) -> Result<(u64, Option<u64>), RangeParseError> {
+	let trimmed = value.trim();
+	if trimmed.len() < 6 {
+		return Err(RangeParseError::Invalid);
+	}
+	if !trimmed[..6].eq_ignore_ascii_case("bytes=") {
+		return Err(RangeParseError::Invalid);
+	}
+	let range_part = trimmed[6..].trim();
+	if range_part.is_empty() {
+		return Err(RangeParseError::Invalid);
+	}
+	let first_range = range_part.split(',').next().unwrap_or("").trim();
+	let mut parts = first_range.splitn(2, '-');
+	let start_str = parts.next().unwrap_or("").trim();
+	let end_str = parts.next().unwrap_or("").trim();
+	if start_str.is_empty() {
+		let Some(total_len) = total else {
+			// Suffix ranges require a known total length.
+			return Err(RangeParseError::Invalid);
+		};
+		let suffix = end_str
+			.parse::<u64>()
+			.map_err(|_| RangeParseError::Invalid)?;
+		if suffix == 0 || total_len == 0 {
+			return Err(RangeParseError::Unsatisfiable);
+		}
+		let start = if suffix >= total_len {
+			0
+		} else {
+			total_len - suffix
+		};
+		let end = total_len.saturating_sub(1);
+		return Ok((start, Some(end)));
+	}
+	let start = start_str
+		.parse::<u64>()
+		.map_err(|_| RangeParseError::Invalid)?;
+	if let Some(total_len) = total {
+		if start >= total_len {
+			return Err(RangeParseError::Unsatisfiable);
+		}
+	}
+	if end_str.is_empty() {
+		return Ok((start, None));
+	}
+	let end = end_str
+		.parse::<u64>()
+		.map_err(|_| RangeParseError::Invalid)?;
+	if end < start {
+		return Err(RangeParseError::Invalid);
+	}
+	let end = if let Some(total_len) = total {
+		end.min(total_len.saturating_sub(1))
+	} else {
+		end
+	};
+	if end < start {
+		return Err(RangeParseError::Unsatisfiable);
+	}
+	Ok((start, Some(end)))
+}
+
+async fn infer_peer_file_size(
+	state: &ApiState,
+	peer: PeerId,
+	path: &str,
+) -> Option<u64> {
+	let normalized = path.replace('\\', "/").trim_end_matches('/').to_string();
+	if normalized.is_empty() {
+		return None;
+	}
+	let (parent, name) = match normalized.rsplit_once('/') {
+		Some((parent, name)) => {
+			let parent = if parent.is_empty() { "/" } else { parent };
+			(parent.to_string(), name.to_string())
+		}
+		None => ("/".to_string(), normalized.clone()),
+	};
+	let entries = state.puppy.list_dir(peer, parent).await.ok()?;
+	let entry = entries
+		.into_iter()
+		.find(|entry| !entry.is_dir && entry.name == name)?;
+	Some(entry.size)
+}
+
 fn load_jwt_secret() -> String {
 	if let Ok(value) = env::var("JWT_SECRET") {
 		let trimmed = value.trim();
@@ -820,18 +909,106 @@ async fn handle_request(
 			let Some(path) = query.get("path") else {
 				return Ok(with_cors(bad_request("missing path"), origin_ref));
 			};
+			let accept_json = req
+				.headers()
+				.get(hyper::header::ACCEPT)
+				.and_then(|v| v.to_str().ok())
+				.map(|v| v.contains(CT_JSON))
+				.unwrap_or(false);
 			let offset = query
 				.get("offset")
 				.and_then(|v| v.parse::<u64>().ok())
 				.unwrap_or(0);
 			let length = query.get("length").and_then(|v| v.parse::<u64>().ok());
-			match state
-				.puppy
-				.read_file(peer, path.clone(), offset, length)
-				.await
-			{
-				Ok(chunk) => json_response(StatusCode::OK, json!(chunk)),
-				Err(err) => bad_request(err.to_string()),
+			let wants_json =
+				accept_json || query.contains_key("offset") || query.contains_key("length");
+
+			if wants_json {
+				match state
+					.puppy
+					.read_file(peer, path.clone(), offset, length)
+					.await
+				{
+					Ok(chunk) => json_response(StatusCode::OK, json!(chunk)),
+					Err(err) => bad_request(err.to_string()),
+				}
+			} else {
+				let mime_type = from_path(path)
+					.first_or_octet_stream()
+					.essence_str()
+					.to_string();
+				let range_header = req.headers().get(RANGE).cloned();
+				let (chunk, status, content_range) = if let Some(range_value) = range_header {
+					let total_len = infer_peer_file_size(&state, peer, path).await;
+					let header_value = match range_value.to_str() {
+						Ok(value) => value,
+						Err(_) => {
+							return Ok(with_cors(bad_request("invalid range header"), origin_ref));
+						}
+					};
+					let (start, end_opt) = match parse_peer_range_header(header_value, total_len) {
+						Ok(value) => value,
+						Err(RangeParseError::Invalid) => {
+							return Ok(with_cors(bad_request("invalid range header"), origin_ref));
+						}
+						Err(RangeParseError::Unsatisfiable) => {
+							return Ok(with_cors(
+								range_not_satisfiable_response(total_len.unwrap_or(0)),
+								origin_ref,
+							));
+						}
+					};
+					let desired_len = end_opt
+						.map(|end| end.saturating_sub(start).saturating_add(1))
+						.unwrap_or(READ_CHUNK_SIZE as u64);
+					let chunk = match state
+						.puppy
+						.read_file(peer, path.clone(), start, Some(desired_len))
+						.await
+					{
+						Ok(chunk) => chunk,
+						Err(err) => {
+							return Ok(with_cors(bad_request(err.to_string()), origin_ref));
+						}
+					};
+					if chunk.data.is_empty() {
+						return Ok(with_cors(
+							range_not_satisfiable_response(total_len.unwrap_or(0)),
+							origin_ref,
+						));
+					}
+					let actual_end = start
+						.saturating_add(chunk.data.len() as u64)
+						.saturating_sub(1);
+					let total_str = total_len
+						.map(|len| len.to_string())
+						.unwrap_or_else(|| "*".to_string());
+					let range_value =
+						format!("bytes {}-{}/{}", start, actual_end, total_str);
+					(chunk, StatusCode::PARTIAL_CONTENT, Some(range_value))
+				} else {
+					let chunk = match state
+						.puppy
+						.read_file(peer, path.clone(), 0, None)
+						.await
+					{
+						Ok(chunk) => chunk,
+						Err(err) => {
+							return Ok(with_cors(bad_request(err.to_string()), origin_ref));
+						}
+					};
+					(chunk, StatusCode::OK, None)
+				};
+
+				let mut builder = Response::builder()
+					.status(status)
+					.header(CONTENT_TYPE, &mime_type)
+					.header(ACCEPT_RANGES, HeaderValue::from_static("bytes"))
+					.header(CONTENT_LENGTH, chunk.data.len().to_string());
+				if let Some(value) = content_range {
+					builder = builder.header(CONTENT_RANGE, value);
+				}
+				builder.body(Body::from(chunk.data)).unwrap()
 			}
 		}
 		(&Method::GET, ["api", "peers", peer_id, "thumbnail"]) => {

@@ -59,6 +59,66 @@ body {
 	flex: 1;
 }
 
+.tree-view {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+}
+
+.tree-row--default {
+	width: 100%;
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 8px 10px;
+	border-radius: 8px;
+	border: 1px solid #334155;
+	background: #020617;
+	color: inherit;
+	text-align: left;
+	cursor: pointer;
+}
+
+.tree-row--default:hover {
+	border-color: #38bdf8;
+	background: rgba(56, 189, 248, .08);
+}
+
+.tree-toggle {
+	width: 18px;
+	flex: 0 0 18px;
+	display: inline-flex;
+	justify-content: center;
+}
+
+.tree-toggle-btn {
+	cursor: pointer;
+	user-select: none;
+}
+
+.tree-toggle-placeholder {
+	width: 18px;
+	height: 18px;
+	display: inline-block;
+}
+
+.tree-body {
+	flex: 1;
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	padding-left: calc(var(--tree-depth) * 16px);
+}
+
+.tree-sublabel {
+	color: #94a3b8;
+	font-size: 0.9rem;
+}
+
+.tree-badge {
+	margin-left: auto;
+}
+
 .page.login-page {
 	min-height: 100vh;
 	display: flex;
@@ -366,6 +426,17 @@ body {
 	gap: 4px;
 }
 
+.storage-tree-name {
+	display: flex;
+	flex-direction: row;
+	align-items: flex-start;
+	gap: 8px;
+}
+
+.storage-tree-name .storage-name-content {
+	margin-left: calc(var(--tree-depth) * 16px);
+}
+
 .storage-node-row {
 	border-bottom: 1px solid #334155;
 }
@@ -547,6 +618,21 @@ body {
 	max-height: 70vh;
 	object-fit: contain;
 	margin: 0 auto;
+}
+
+.file-preview pre.file-content--video {
+	padding: 0;
+	background: transparent;
+	border: none;
+	max-height: none;
+	overflow: visible;
+}
+
+.file-preview pre.file-content--video video {
+	width: 100%;
+	max-height: 70vh;
+	background: #000;
+	border-radius: 8px;
 }
 
 .file-actions {

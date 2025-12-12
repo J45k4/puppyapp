@@ -63,6 +63,53 @@ function matchRoute(pattern, path) {
 }
 
 // src/api.ts
+var parseUpdateProgress = (raw) => {
+  const entries = Object.entries(raw);
+  if (entries.length !== 1) {
+    return null;
+  }
+  const [first] = entries;
+  if (!first) {
+    return null;
+  }
+  const [key, value] = first;
+  switch (key) {
+    case "FetchingRelease":
+      return { type: "FetchingRelease" };
+    case "Downloading": {
+      if (value && typeof value === "object" && "filename" in value && typeof value.filename === "string") {
+        return { type: "Downloading", filename: value.filename };
+      }
+      return null;
+    }
+    case "Unpacking":
+      return { type: "Unpacking" };
+    case "Verifying":
+      return { type: "Verifying" };
+    case "Installing":
+      return { type: "Installing" };
+    case "Completed": {
+      if (value && typeof value === "object" && "version" in value && typeof value.version === "string") {
+        return { type: "Completed", version: value.version };
+      }
+      return null;
+    }
+    case "Failed": {
+      if (value && typeof value === "object" && "error" in value && typeof value.error === "string") {
+        return { type: "Failed", error: value.error };
+      }
+      return null;
+    }
+    case "AlreadyUpToDate": {
+      if (value && typeof value === "object" && "current_version" in value && typeof value.current_version === "number") {
+        return { type: "AlreadyUpToDate", current_version: value.current_version };
+      }
+      return null;
+    }
+    default:
+      return null;
+  }
+};
 var envAddr = "http://localhost:4242";
 var serverAddr = envAddr && envAddr.trim().length > 0 ? envAddr : typeof window !== "undefined" ? window.location.origin : "/";
 var apiBase = serverAddr.endsWith("/") ? serverAddr.slice(0, -1) : serverAddr;
@@ -185,6 +232,69 @@ var fetchReleases = async (limit = 5) => {
     throw new Error(`GitHub releases request failed: ${res.status}`);
   }
   return await res.json();
+};
+var fetchFileByHash = async (hash) => {
+  const headers = authHeaders();
+  const res = await fetch(`${apiBase}/api/file/hash?hash=${encodeURIComponent(hash)}`, {
+    method: "GET",
+    credentials: "include",
+    headers
+  });
+  if (res.status === 401) {
+    throw new Error("not authenticated");
+  }
+  if (!res.ok) {
+    let errorMessage = `Request failed: ${res.status}`;
+    try {
+      const payload = await res.json();
+      if (payload && typeof payload.error === "string") {
+        errorMessage = payload.error;
+      }
+    } catch {}
+    throw new Error(errorMessage);
+  }
+  const arrayBuffer = await res.arrayBuffer();
+  const mime = res.headers.get("content-type") ?? "application/octet-stream";
+  const lengthHeader = res.headers.get("content-length");
+  return {
+    data: new Uint8Array(arrayBuffer),
+    mime,
+    length: lengthHeader ? Number(lengthHeader) : arrayBuffer.byteLength,
+    status: res.status
+  };
+};
+var fetchPeerFileChunk = async (peerId, path, length) => {
+  const params = new URLSearchParams;
+  params.set("path", path);
+  if (length !== undefined) {
+    params.set("length", String(length));
+  }
+  return apiGet(`/api/peers/${encodeURIComponent(peerId)}/file?${params.toString()}`);
+};
+var startPeerUpdate = async (peerId, version) => {
+  const auth = authHeaders();
+  const headers = {
+    "content-type": "application/json",
+    ...auth ?? {}
+  };
+  const res = await fetch(`${apiBase}/api/updates/${encodeURIComponent(peerId)}`, {
+    method: "POST",
+    credentials: "include",
+    headers,
+    body: JSON.stringify({ version })
+  });
+  if (res.status === 401) {
+    throw new Error("not authenticated");
+  }
+  if (!res.ok) {
+    throw new Error(`Failed to start update: ${res.status}`);
+  }
+  const data = await res.json();
+  return data.update_id;
+};
+var pollPeerUpdate = async (updateId) => {
+  const data = await apiGet(`/api/updates/${updateId}/events`);
+  return data.events.map((event) => parseUpdateProgress(event)).filter((event) => event !== null);
 };
 var login = async (username, password, setCookie) => {
   const res = await fetch(`${apiBase}/auth/login`, {
@@ -422,6 +532,27 @@ var renderInterfaceRows = (interfaces) => interfaces.map((iface) => `
 					</div>
 				</div>
 			`).join("");
+var formatUpdateMessage = (event) => {
+  switch (event.type) {
+    case "FetchingRelease":
+      return "Fetching release metadata";
+    case "Downloading":
+      return `Downloading ${event.filename}`;
+    case "Unpacking":
+      return "Unpacking update";
+    case "Verifying":
+      return "Verifying update";
+    case "Installing":
+      return "Installing update";
+    case "Completed":
+      return `Update completed (version ${event.version})`;
+    case "Failed":
+      return `Update failed: ${event.error}`;
+    case "AlreadyUpToDate":
+      return `Already up to date (version ${event.current_version})`;
+  }
+};
+var describeError = (error) => error instanceof Error ? error.message : String(error);
 var renderPeers = async () => {
   const content = ensureShell("/peers");
   content.innerHTML = `
@@ -523,6 +654,12 @@ var renderPeerDetail = async (peerId) => {
 			<p id="peer-interfaces-status" class="muted">Interface metrics will appear here.</p>
 			<div id="peer-interfaces-list" class="resource-list"></div>
 		</div>
+		<div class="card" id="peer-update-card">
+			<h2>Updates</h2>
+			<p id="peer-update-status" class="muted">Update status will appear here.</p>
+			<button type="button" id="peer-update-button">Update peer</button>
+			<div id="peer-update-log" class="updates-list"></div>
+		</div>
 	`;
   const backBtn = document.getElementById("back-to-peers");
   if (backBtn) {
@@ -572,6 +709,102 @@ var renderPeerDetail = async (peerId) => {
       interfacesListEl.innerHTML = `<p class="muted">Failed to load interface data.</p>`;
     }
   };
+  const updateStatusEl = document.getElementById("peer-update-status");
+  const updateLogEl = document.getElementById("peer-update-log");
+  const updateButton = document.getElementById("peer-update-button");
+  const updateState = {
+    updateId: null,
+    inProgress: false,
+    done: false,
+    events: [],
+    error: null
+  };
+  let updatePoll = null;
+  const renderUpdateLog = () => {
+    if (!updateLogEl)
+      return;
+    if (!updateState.events.length) {
+      updateLogEl.innerHTML = `<p class="muted">No update activity yet.</p>`;
+      return;
+    }
+    updateLogEl.innerHTML = updateState.events.map((event) => `
+					<div class="update-event update-event-${event.type.toLowerCase()}">
+						${escapeHtml(formatUpdateMessage(event))}
+					</div>
+				`).join("");
+  };
+  const setUpdateStatus = (message) => {
+    if (updateStatusEl) {
+      updateStatusEl.textContent = message;
+    }
+  };
+  const setUpdateButtonState = () => {
+    if (updateButton) {
+      updateButton.disabled = updateState.inProgress;
+    }
+  };
+  const clearUpdatePoll = () => {
+    if (updatePoll !== null) {
+      window.clearTimeout(updatePoll);
+      updatePoll = null;
+    }
+  };
+  const pollUpdates = async () => {
+    if (!updateState.updateId) {
+      return;
+    }
+    try {
+      const events = await pollPeerUpdate(updateState.updateId);
+      if (events.length > 0) {
+        updateState.events.push(...events);
+        renderUpdateLog();
+        const last = events[events.length - 1];
+        setUpdateStatus(formatUpdateMessage(last));
+        if (last.type === "Completed" || last.type === "Failed" || last.type === "AlreadyUpToDate") {
+          updateState.inProgress = false;
+          updateState.done = true;
+          clearUpdatePoll();
+          setUpdateButtonState();
+          return;
+        }
+      }
+    } catch (error) {
+      updateState.error = describeError(error);
+      updateState.inProgress = false;
+      setUpdateStatus(`Update polling failed: ${updateState.error}`);
+      setUpdateButtonState();
+      clearUpdatePoll();
+      return;
+    }
+    if (updateState.inProgress) {
+      updatePoll = window.setTimeout(pollUpdates, 1500);
+    }
+  };
+  const handleUpdateClick = async () => {
+    if (updateState.inProgress) {
+      return;
+    }
+    updateState.events = [];
+    updateState.error = null;
+    updateState.done = false;
+    updateState.updateId = null;
+    renderUpdateLog();
+    setUpdateStatus("Starting update...");
+    setUpdateButtonState();
+    try {
+      const updateId = await startPeerUpdate(peerId);
+      updateState.updateId = updateId;
+      updateState.inProgress = true;
+      setUpdateButtonState();
+      setUpdateStatus("Update started...");
+      pollUpdates();
+    } catch (error) {
+      updateState.error = describeError(error);
+      updateState.inProgress = false;
+      setUpdateButtonState();
+      setUpdateStatus(`Failed to start update: ${updateState.error}`);
+    }
+  };
   try {
     const peer = await findPeer(peerId);
     if (!peer) {
@@ -597,6 +830,112 @@ var renderPeerDetail = async (peerId) => {
     if (statusEl)
       statusEl.textContent = `Failed to load peer: ${err}`;
   }
+  updateButton?.addEventListener("click", () => {
+    handleUpdateClick();
+  });
+  setUpdateButtonState();
+  renderUpdateLog();
+};
+
+// src/treeview.ts
+var defaultRow = (node, depth, expanded, hasChildren) => {
+  const row = document.createElement("button");
+  row.type = "button";
+  row.className = "tree-row tree-row--default";
+  row.style.setProperty("--tree-depth", String(depth));
+  row.setAttribute("data-tree-id", node.id);
+  row.innerHTML = `
+		<span class="tree-toggle">
+			${hasChildren ? `<span class="tree-toggle-btn" data-tree-toggle="${node.id}">${expanded ? "▾" : "▸"}</span>` : `<span class="tree-toggle-placeholder"></span>`}
+		</span>
+		<span class="tree-body">
+			<span class="tree-label">${node.label}</span>
+			${node.sublabel ? `<span class="tree-sublabel">${node.sublabel}</span>` : ""}
+		</span>
+		${node.badge ? `<span class="badge small tree-badge">${node.badge}</span>` : ""}
+	`;
+  return row;
+};
+var createTreeView = (options) => {
+  let nodes = options.nodes;
+  const expanded = options.expanded ?? new Set;
+  let nodeById = new Map;
+  const root = document.createElement("div");
+  root.className = `tree-view${options.className ? ` ${options.className}` : ""}`;
+  const buildMap = (list) => {
+    nodeById = new Map;
+    const walk = (items) => {
+      for (const item of items) {
+        nodeById.set(item.id, item);
+        if (item.children?.length) {
+          walk(item.children);
+        }
+      }
+    };
+    walk(list);
+  };
+  const renderNodes = (list, depth) => {
+    for (const node of list) {
+      const hasChildren = Boolean(node.children && node.children.length > 0);
+      const isExpanded = expanded.has(node.id);
+      const row = options.renderRow ? options.renderRow(node, depth, isExpanded, hasChildren) : defaultRow(node, depth, isExpanded, hasChildren);
+      if (!row.getAttribute("data-tree-id")) {
+        row.setAttribute("data-tree-id", node.id);
+      }
+      row.style.setProperty("--tree-depth", String(depth));
+      root.appendChild(row);
+      if (hasChildren && isExpanded) {
+        renderNodes(node.children, depth + 1);
+      }
+    }
+  };
+  const render = () => {
+    root.innerHTML = "";
+    renderNodes(nodes, 0);
+  };
+  const toggleNode = (id) => {
+    if (expanded.has(id)) {
+      expanded.delete(id);
+    } else {
+      expanded.add(id);
+    }
+    render();
+  };
+  root.addEventListener("click", (event) => {
+    const target = event.target;
+    if (!target)
+      return;
+    const toggleEl = target.closest("[data-tree-toggle]");
+    if (toggleEl) {
+      const id2 = toggleEl.getAttribute("data-tree-toggle");
+      if (id2) {
+        event.stopPropagation();
+        toggleNode(id2);
+      }
+      return;
+    }
+    const rowEl = target.closest("[data-tree-id]");
+    if (!rowEl)
+      return;
+    const id = rowEl.getAttribute("data-tree-id");
+    if (!id)
+      return;
+    const node = nodeById.get(id);
+    if (!node)
+      return;
+    options.onSelect?.(node);
+  });
+  buildMap(nodes);
+  render();
+  return {
+    element: root,
+    expanded,
+    setNodes: (next) => {
+      nodes = next;
+      buildMap(nodes);
+      render();
+    }
+  };
 };
 
 // src/pages/files.ts
@@ -696,6 +1035,40 @@ var renderFiles = async () => {
     loading: false,
     error: null
   };
+  const tree = createTreeView({
+    nodes: [],
+    className: "files-tree",
+    onSelect: (node) => {
+      if (state.loading)
+        return;
+      if (state.showingDisks) {
+        const disk = node.data;
+        state.showingDisks = false;
+        state.path = disk.mount_path;
+        state.entries = [];
+        state.error = null;
+        loadBrowser();
+        return;
+      }
+      const entry = node.data;
+      const target = joinChildPath(state.path, entry.name);
+      if (entry.is_dir) {
+        state.showingDisks = false;
+        state.path = target;
+        state.entries = [];
+        state.error = null;
+        loadBrowser();
+        return;
+      }
+      const params = new URLSearchParams;
+      params.set("peer", state.peerId);
+      params.set("path", target);
+      navigate(`/file?${params.toString()}`);
+    }
+  });
+  if (browserEl) {
+    browserEl.appendChild(tree.element);
+  }
   const updateControls = () => {
     const disabled = state.loading;
     if (peerSelect) {
@@ -719,90 +1092,61 @@ var renderFiles = async () => {
       return;
     if (state.loading) {
       browserEl.innerHTML = `<p class="muted">Loading ${state.showingDisks ? "disks" : "directory"}...</p>`;
+      browserEl.appendChild(tree.element);
       return;
     }
     if (state.error) {
       browserEl.innerHTML = `<p class="muted">Error: ${escapeHtml2(state.error)}</p>`;
+      browserEl.appendChild(tree.element);
+      tree.setNodes([]);
       return;
     }
     if (state.showingDisks) {
       if (!state.disks.length) {
         browserEl.innerHTML = `<p class="muted">No disks were reported for this peer.</p>`;
+        browserEl.appendChild(tree.element);
+        tree.setNodes([]);
         return;
       }
-      const rows2 = state.disks.map((disk) => {
+      const nodes2 = state.disks.map((disk) => {
         const label = disk.name || disk.mount_path;
-        return `
-					<div class="files-row">
-						<div>
-							<strong>${escapeHtml2(label)}</strong>
-							<p class="muted">${escapeHtml2(disk.mount_path)}</p>
-							<p>${formatSize(disk.available_space)} free of ${formatSize(disk.total_space)}</p>
-						</div>
-						<button type="button" class="link-btn" data-disk-path="${escapeHtml2(disk.mount_path)}">Browse</button>
-					</div>
-				`;
-      }).join("");
-      browserEl.innerHTML = `<div class="files-list">${rows2}</div>`;
-      const diskButtons = browserEl.querySelectorAll("[data-disk-path]");
-      diskButtons.forEach((btn) => {
-        btn.addEventListener("click", () => {
-          const diskPath = btn.dataset.diskPath;
-          if (!diskPath)
-            return;
-          state.showingDisks = false;
-          state.path = diskPath;
-          state.entries = [];
-          state.error = null;
-          loadBrowser();
-        });
+        return {
+          id: `disk:${disk.mount_path}`,
+          label: escapeHtml2(label),
+          sublabel: escapeHtml2(`${disk.mount_path} • ${formatSize(disk.available_space)} free of ${formatSize(disk.total_space)}`),
+          badge: "disk",
+          data: disk
+        };
       });
+      browserEl.innerHTML = "";
+      browserEl.appendChild(tree.element);
+      tree.setNodes(nodes2);
       return;
     }
     if (!state.entries.length) {
       browserEl.innerHTML = `<p class="muted">Directory is empty.</p>`;
+      browserEl.appendChild(tree.element);
+      tree.setNodes([]);
       return;
     }
-    const rows = state.entries.map((entry) => {
-      const label = entry.is_dir ? `[DIR] ${escapeHtml2(entry.name)}` : escapeHtml2(entry.name);
-      const meta = entry.is_dir ? "Directory" : `${entry.mime ?? "File"} • ${formatSize(entry.size)}`;
-      return `
-				<button
-					type="button"
-					class="files-entry"
-					data-entry-name="${escapeHtml2(entry.name)}"
-					data-entry-dir="${entry.is_dir ? "1" : "0"}"
-				>
-					<div>
-						<strong>${label}</strong>
-						<p class="muted">${meta}</p>
-					</div>
-					<span class="badge small">${entry.is_dir ? "dir" : "file"}</span>
-				</button>
-			`;
-    }).join("");
-    browserEl.innerHTML = `<div class="files-list">${rows}</div>`;
-    const entryButtons = browserEl.querySelectorAll("[data-entry-name]");
-    entryButtons.forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const name = btn.dataset.entryName;
-        if (!name)
-          return;
-        const isDir = btn.dataset.entryDir === "1";
-        const target = joinChildPath(state.path, name);
-        if (isDir) {
-          state.showingDisks = false;
-          state.path = target;
-          state.entries = [];
-          state.error = null;
-          loadBrowser();
-          return;
-        }
-        if (statusEl) {
-          statusEl.textContent = `Selected ${target}`;
-        }
-      });
+    const sorted = [...state.entries].sort((a, b) => {
+      if (a.is_dir !== b.is_dir)
+        return a.is_dir ? -1 : 1;
+      return a.name.localeCompare(b.name);
     });
+    const nodes = sorted.map((entry) => {
+      const meta = entry.is_dir ? "Directory" : `${entry.mime ?? "File"} • ${formatSize(entry.size)}`;
+      return {
+        id: joinChildPath(state.path, entry.name),
+        label: escapeHtml2(entry.name),
+        sublabel: escapeHtml2(meta),
+        badge: entry.is_dir ? "dir" : "file",
+        data: entry
+      };
+    });
+    browserEl.innerHTML = "";
+    browserEl.appendChild(tree.element);
+    tree.setNodes(nodes);
   };
   const updateBrowserView = () => {
     updateControls();
@@ -896,7 +1240,7 @@ var renderFiles = async () => {
     loadBrowser();
   };
   const formatPeerOption = (peerId, label) => `<option value="${escapeHtml2(peerId)}">${escapeHtml2(label)}</option>`;
-  const describeError = (error) => error instanceof Error ? error.message : String(error);
+  const describeError2 = (error) => error instanceof Error ? error.message : String(error);
   const loadPeers = async () => {
     if (peerSelect) {
       peerSelect.disabled = true;
@@ -913,7 +1257,7 @@ var renderFiles = async () => {
     try {
       peers = await fetchPeers();
     } catch (err) {
-      peerError = describeError(err);
+      peerError = describeError2(err);
       peers = [];
     }
     if (!peerSelect) {
@@ -1109,6 +1453,7 @@ var createMultiSelect = (props) => {
 };
 
 // src/pages/search.ts
+var escapeHtml3 = (value) => value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 var defaultPageSize = 25;
 var renderSearch = async () => {
   const content = ensureShell("/search");
@@ -1169,32 +1514,85 @@ var renderSearch = async () => {
 						<tr>
 							<th>Name</th>
 							<th>Type</th>
-						<th>Size</th>
-						<th>Replicas</th>
-						<th>Updated</th>
-					</tr>
-				</thead>
+							<th>Size</th>
+							<th>Replicas</th>
+							<th>Updated</th>
+							<th>Hash</th>
+							<th></th>
+						</tr>
+					</thead>
 					<tbody id="search-body"></tbody>
 				</table>
 			</div>
 			<div id="search-sentinel"></div>
 		`;
   };
+  const formatHashValue = (value) => {
+    if (!value)
+      return "";
+    if (typeof value === "string") {
+      return value;
+    }
+    if (!Array.isArray(value)) {
+      return "";
+    }
+    return value.map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  };
+  const shortHash = (value) => {
+    if (!value)
+      return "";
+    return value.length > 16 ? `${value.slice(0, 8)}…${value.slice(-8)}` : value;
+  };
   const appendRows = (rows) => {
     const body = document.getElementById("search-body");
     if (!body)
       return;
-    const html = rows.map((r) => `
-					<tr>
-						<td>${r.name}</td>
-						<td class="muted">${r.mime_type ?? "unknown"}</td>
-						<td>${((r.size ?? 0) / 1024).toFixed(1)} KB</td>
-						<td><span class="badge small">${r.replicas} replicas</span></td>
-						<td class="muted">${r.latest_datetime ?? ""}</td>
-					</tr>
-				`).join("");
+    const html = rows.map((r) => {
+      const hash = formatHashValue(r.hash);
+      const nodeId = formatHashValue(r.node_id);
+      const path = r.path ?? "";
+      return `
+						<tr>
+							<td>${escapeHtml3(r.name ?? "")}</td>
+							<td class="muted">${escapeHtml3(r.mime_type ?? "unknown")}</td>
+							<td>${((r.size ?? 0) / 1024).toFixed(1)} KB</td>
+							<td><span class="badge small">${r.replicas} replicas</span></td>
+							<td class="muted">${escapeHtml3(r.latest_datetime ?? "")}</td>
+							<td class="muted hash-cell">${escapeHtml3(shortHash(hash))}</td>
+							<td>
+								<button
+									type="button"
+									class="link-btn"
+									data-hash-link="${escapeHtml3(hash)}"
+									data-node-id="${escapeHtml3(nodeId)}"
+									data-path="${escapeHtml3(path)}"
+								>
+									View
+								</button>
+							</td>
+						</tr>
+					`;
+    }).join("");
     body.insertAdjacentHTML("beforeend", html);
   };
+  tableEl?.addEventListener("click", (event) => {
+    const target = event.target;
+    const button = target?.closest("[data-hash-link]");
+    if (!button)
+      return;
+    const hash = button.getAttribute("data-hash-link");
+    if (!hash)
+      return;
+    const nodeId = button.getAttribute("data-node-id");
+    const path = button.getAttribute("data-path");
+    const params = new URLSearchParams;
+    if (nodeId)
+      params.set("node", nodeId);
+    if (path)
+      params.set("path", path);
+    const suffix = params.toString() ? `?${params.toString()}` : "";
+    navigate(`/file/${encodeURIComponent(hash)}${suffix}`);
+  });
   const loadPage = async () => {
     if (loading)
       return;
@@ -1279,7 +1677,7 @@ var formatSize2 = (value) => {
   }
   return `${size.toFixed(1)} ${units[index]}`;
 };
-var escapeHtml3 = (value) => value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+var escapeHtml4 = (value) => value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 var formatTimestamp = (value) => {
   if (!value) {
     return "-";
@@ -1450,10 +1848,74 @@ var renderStorage = async () => {
     nodes: [],
     loading: true,
     error: null,
-    expandedNodes: new Set,
-    expandedEntries: new Set,
     customStatus: null
   };
+  const buildEntryNodes = (nodeId, entries) => entries.map((entry) => ({
+    id: `${nodeId}:${entry.path}`,
+    label: entry.name,
+    sublabel: entry.path,
+    data: entry,
+    children: buildEntryNodes(nodeId, entry.children)
+  }));
+  const renderRow = (node, depth, expanded, hasChildren) => {
+    const row = document.createElement("div");
+    row.className = "storage-row storage-tree-row";
+    row.setAttribute("data-tree-id", node.id);
+    row.style.setProperty("--tree-depth", String(depth));
+    const data = node.data;
+    const isTopNode = data.entries !== undefined;
+    if (isTopNode) {
+      const storageNode = data;
+      row.innerHTML = `
+				<div class="storage-cell storage-name storage-tree-name">
+					${hasChildren ? `<button type="button" class="link-btn" data-tree-toggle="${node.id}">${expanded ? "▾" : "▸"}</button>` : `<span class="storage-toggle-placeholder"></span>`}
+					<div class="storage-name-content">
+						<strong>${escapeHtml4(storageNode.name)}</strong>
+						<p class="muted storage-node-id">${escapeHtml4(storageNode.id)}</p>
+					</div>
+				</div>
+				<div class="storage-cell">100%</div>
+				<div class="storage-cell">${formatSize2(storageNode.totalSize)}</div>
+				<div class="storage-cell">-</div>
+				<div class="storage-cell muted">-</div>
+				<div class="storage-cell"></div>
+			`;
+      return row;
+    }
+    const entry = data;
+    const openButton = hasChildren ? "" : `<button type="button" class="link-btn" data-entry-open="${escapeHtml4(entry.path)}">Open</button>`;
+    row.innerHTML = `
+			<div class="storage-cell storage-name storage-tree-name">
+				${hasChildren ? `<button type="button" class="link-btn" data-tree-toggle="${node.id}">${expanded ? "▾" : "▸"}</button>` : `<span class="storage-toggle-placeholder"></span>`}
+				<div class="storage-name-content">
+					<strong>${escapeHtml4(entry.name)}</strong>
+					<p class="muted">${escapeHtml4(entry.path)}</p>
+				</div>
+			</div>
+			<div class="storage-cell">${entry.percent.toFixed(1)}%</div>
+			<div class="storage-cell">${formatSize2(entry.size)}</div>
+			<div class="storage-cell">${entry.itemCount}</div>
+			<div class="storage-cell">${formatTimestamp(entry.lastChanged)}</div>
+			<div class="storage-cell">${openButton}</div>
+		`;
+    return row;
+  };
+  const tree = createTreeView({
+    nodes: [],
+    className: "storage-tree",
+    renderRow,
+    onSelect: (node) => {
+      const data = node.data;
+      if (data.path !== undefined) {
+        const entry = data;
+        state.customStatus = `Selected ${entry.path}`;
+        updateStatus();
+      }
+    }
+  });
+  if (listEl) {
+    listEl.appendChild(tree.element);
+  }
   const updateStatus = () => {
     if (!statusEl)
       return;
@@ -1471,98 +1933,38 @@ var renderStorage = async () => {
       statusEl.textContent = `Showing ${state.nodes.length} node(s)`;
     }
   };
-  const renderEntries = (nodeIndex, entries, depth) => entries.map((entry) => {
-    const entryKey = `${nodeIndex}:${entry.path}`;
-    const isExpanded = state.expandedEntries.has(entryKey);
-    const hasChildren = entry.children.length > 0;
-    const toggleLabel = hasChildren ? isExpanded ? "▾" : "▸" : "";
-    const openButton = hasChildren ? "" : `<button type="button" class="link-btn" data-entry-open="${escapeHtml3(entry.path)}">Open</button>`;
-    return `
-					<div class="storage-row storage-entry-row">
-						<div class="storage-cell storage-entry-name">
-							${hasChildren ? `<button type="button" class="link-btn" data-entry-toggle="${entryKey}">${toggleLabel}</button>` : '<span class="storage-toggle-placeholder"></span>'}
-							<div class="storage-name-content" style="margin-left: ${depth * 16}px">
-								<strong>${escapeHtml3(entry.name)}</strong>
-								<p class="muted">${escapeHtml3(entry.path)}</p>
-							</div>
-						</div>
-						<div class="storage-cell">${entry.percent.toFixed(1)}%</div>
-						<div class="storage-cell">${formatSize2(entry.size)}</div>
-						<div class="storage-cell">${entry.itemCount}</div>
-						<div class="storage-cell">${formatTimestamp(entry.lastChanged)}</div>
-						<div class="storage-cell">${openButton}</div>
-					</div>
-					${isExpanded ? `<div class="storage-entry-children">${renderEntries(nodeIndex, entry.children, depth + 1)}</div>` : ""}
-				`;
-  }).join("");
-  const renderNode = (node, index) => {
-    const isExpanded = state.expandedNodes.has(index);
-    const toggleLabel = node.entries.length ? isExpanded ? "▾" : "▸" : "";
-    return `
-			<div class="storage-node">
-				<div class="storage-row storage-node-row">
-					<div class="storage-cell storage-name">
-						${node.entries.length ? `<button type="button" class="link-btn" data-node-index="${index}">${toggleLabel}</button>` : '<span class="storage-toggle-placeholder"></span>'}
-						<div class="storage-name-content">
-							<strong>${escapeHtml3(node.name)}</strong>
-							<p class="muted storage-node-id">${escapeHtml3(node.id)}</p>
-						</div>
-					</div>
-					<div class="storage-cell">100%</div>
-					<div class="storage-cell">${formatSize2(node.totalSize)}</div>
-					<div class="storage-cell">-</div>
-					<div class="storage-cell muted">-</div>
-					<div class="storage-cell"></div>
-				</div>
-				${isExpanded ? `<div class="storage-entries">${renderEntries(index, node.entries, 1)}</div>` : ""}
-			</div>
-		`;
-  };
   const updateStorageView = () => {
     if (!listEl)
       return;
     if (state.loading) {
       listEl.innerHTML = `<p class="muted">Loading storage usage...</p>`;
+      listEl.appendChild(tree.element);
+      tree.setNodes([]);
     } else if (state.error) {
-      const errorMessage = escapeHtml3(state.error ?? "Unknown error");
+      const errorMessage = escapeHtml4(state.error ?? "Unknown error");
       listEl.innerHTML = `<p class="muted">Error: ${errorMessage}</p>`;
+      listEl.appendChild(tree.element);
+      tree.setNodes([]);
     } else if (!state.nodes.length) {
       listEl.innerHTML = `<p class="muted">No storage data available.</p>`;
+      listEl.appendChild(tree.element);
+      tree.setNodes([]);
     } else {
-      listEl.innerHTML = state.nodes.map(renderNode).join("");
+      const nodes = state.nodes.map((storageNode) => {
+        const nodeId = `node:${storageNode.id}`;
+        return {
+          id: nodeId,
+          label: storageNode.name,
+          sublabel: storageNode.id,
+          data: storageNode,
+          children: buildEntryNodes(nodeId, storageNode.entries)
+        };
+      });
+      listEl.innerHTML = "";
+      listEl.appendChild(tree.element);
+      tree.setNodes(nodes);
     }
     updateStatus();
-    if (!listEl)
-      return;
-    const nodeButtons = listEl.querySelectorAll("[data-node-index]");
-    nodeButtons.forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const value = btn.getAttribute("data-node-index");
-        if (!value)
-          return;
-        const index = Number(value);
-        if (state.expandedNodes.has(index)) {
-          state.expandedNodes.delete(index);
-        } else {
-          state.expandedNodes.add(index);
-        }
-        updateStorageView();
-      });
-    });
-    const entryToggleButtons = listEl.querySelectorAll("[data-entry-toggle]");
-    entryToggleButtons.forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const key = btn.getAttribute("data-entry-toggle");
-        if (!key)
-          return;
-        if (state.expandedEntries.has(key)) {
-          state.expandedEntries.delete(key);
-        } else {
-          state.expandedEntries.add(key);
-        }
-        updateStorageView();
-      });
-    });
     const entryOpenButtons = listEl.querySelectorAll("[data-entry-open]");
     entryOpenButtons.forEach((btn) => {
       btn.addEventListener("click", () => {
@@ -1579,8 +1981,6 @@ var renderStorage = async () => {
     state.error = null;
     state.customStatus = null;
     state.nodes = [];
-    state.expandedNodes.clear();
-    state.expandedEntries.clear();
     updateStorageView();
     try {
       const files = await fetchStorageUsage();
@@ -1607,7 +2007,7 @@ var formatDate = (value) => {
   }
   return date.toLocaleString();
 };
-var escapeHtml4 = (value) => value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+var escapeHtml5 = (value) => value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 var snippet = (value, limit = 280) => {
   if (!value) {
     return "";
@@ -1656,7 +2056,7 @@ var renderReleaseNotes = (body) => {
   }
   return `
 		<div class="release-notes">
-			<pre>${escapeHtml4(body)}</pre>
+			<pre>${escapeHtml5(body)}</pre>
 		</div>
 	`;
 };
@@ -1851,6 +2251,341 @@ var renderLogin = async () => {
   });
 };
 
+// src/pages/file.ts
+var formatBytes3 = (value) => {
+  if (value < 1024) {
+    return `${value} B`;
+  }
+  const units = ["KB", "MB", "GB", "TB"];
+  let size = value / 1024;
+  let index = 0;
+  while (size >= 1024 && index < units.length - 1) {
+    index += 1;
+    size /= 1024;
+  }
+  return `${size.toFixed(1)} ${units[index]}`;
+};
+var escapeHtml6 = (value) => value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+var isTextMime = (mime) => /^(text\/|application\/(json|xml|javascript|svg|x-www-form-urlencoded))/i.test(mime);
+var isImageMime = (mime) => /^image\//i.test(mime);
+var isVideoMime = (mime) => /^video\//i.test(mime);
+var previewLimit = 160000;
+var decodeText = (data) => {
+  const decoder = new TextDecoder("utf-8", { fatal: false });
+  return decoder.decode(data);
+};
+var createPreviewRenderer = (previewEl, noteEl) => {
+  let currentObjectUrl = null;
+  const cleanup = () => {
+    if (currentObjectUrl) {
+      URL.revokeObjectURL(currentObjectUrl);
+      currentObjectUrl = null;
+    }
+  };
+  const render = (result, mediaUrl) => {
+    if (!previewEl || !noteEl) {
+      return;
+    }
+    cleanup();
+    previewEl.classList.remove("file-content--image");
+    previewEl.classList.remove("file-content--video");
+    if (isImageMime(result.mime)) {
+      const blob = new Blob([result.data.buffer], { type: result.mime });
+      currentObjectUrl = URL.createObjectURL(blob);
+      const img = document.createElement("img");
+      img.src = currentObjectUrl;
+      img.alt = "Image preview";
+      img.loading = "lazy";
+      img.decoding = "async";
+      previewEl.classList.add("file-content--image");
+      previewEl.textContent = "";
+      previewEl.appendChild(img);
+      noteEl.textContent = "";
+      return;
+    }
+    if (isVideoMime(result.mime)) {
+      const sourceUrl = mediaUrl ?? (() => {
+        const blob = new Blob([result.data.buffer], { type: result.mime });
+        currentObjectUrl = URL.createObjectURL(blob);
+        return currentObjectUrl;
+      })();
+      const video = document.createElement("video");
+      const source = document.createElement("source");
+      source.src = sourceUrl;
+      source.type = result.mime;
+      video.appendChild(source);
+      video.controls = true;
+      video.preload = "metadata";
+      video.className = "file-video";
+      previewEl.classList.add("file-content--video");
+      previewEl.textContent = "";
+      previewEl.appendChild(video);
+      noteEl.textContent = "";
+      return;
+    }
+    const truncated = result.data.length > previewLimit;
+    const chunk = result.data.slice(0, previewLimit);
+    if (isTextMime(result.mime)) {
+      previewEl.textContent = decodeText(chunk);
+      noteEl.textContent = truncated ? "Preview truncated to avoid flooding the UI." : "";
+      return;
+    }
+    const snippet2 = chunk.slice(0, 128);
+    const hex = Array.from(snippet2).map((byte) => byte.toString(16).padStart(2, "0")).join(" ");
+    previewEl.textContent = hex;
+    noteEl.textContent = result.data.length ? `Binary data (${result.mime}); showing first ${snippet2.length} byte(s).` : "No data available.";
+  };
+  return { render, cleanup };
+};
+var guessMimeFromPath = (value) => {
+  const normalized = value.trim().toLowerCase();
+  if (normalized.endsWith(".txt"))
+    return "text/plain";
+  if (normalized.endsWith(".json"))
+    return "application/json";
+  if (normalized.endsWith(".md"))
+    return "text/markdown";
+  if (normalized.endsWith(".csv"))
+    return "text/csv";
+  if (normalized.endsWith(".html") || normalized.endsWith(".htm"))
+    return "text/html";
+  if (normalized.endsWith(".xml"))
+    return "application/xml";
+  if (normalized.endsWith(".js"))
+    return "application/javascript";
+  if (normalized.endsWith(".png"))
+    return "image/png";
+  if (normalized.endsWith(".jpg") || normalized.endsWith(".jpeg"))
+    return "image/jpeg";
+  if (normalized.endsWith(".gif"))
+    return "image/gif";
+  if (normalized.endsWith(".webp"))
+    return "image/webp";
+  if (normalized.endsWith(".bmp"))
+    return "image/bmp";
+  if (normalized.endsWith(".ico"))
+    return "image/x-icon";
+  if (normalized.endsWith(".mp4") || normalized.endsWith(".m4v"))
+    return "video/mp4";
+  if (normalized.endsWith(".webm"))
+    return "video/webm";
+  if (normalized.endsWith(".mov"))
+    return "video/quicktime";
+  if (normalized.endsWith(".avi"))
+    return "video/x-msvideo";
+  if (normalized.endsWith(".mkv"))
+    return "video/x-matroska";
+  return "application/octet-stream";
+};
+var renderFileByHash = async (hash) => {
+  const content = ensureShell(`/file/${hash}`);
+  content.innerHTML = `
+	<section class="hero">
+		<h1>File</h1>
+		<p class="lede">Viewing file contents for hash ${escapeHtml6(hash)}</p>
+	</section>
+	<div class="card" id="file-card">
+		<div class="card-heading">
+			<h2>File preview</h2>
+			<p id="file-status" class="muted">Loading file data…</p>
+		</div>
+		<div class="file-meta">
+			<p><span class="muted">Hash:</span> ${escapeHtml6(hash)}</p>
+			<p><span class="muted">Download:</span> <a id="file-download" target="_blank" rel="noreferrer">Raw download</a></p>
+			<p><span class="muted">MIME:</span> <span id="file-mime">-</span></p>
+			<p><span class="muted">Size:</span> <span id="file-size">-</span></p>
+		</div>
+		<div class="file-preview">
+			<h3>Preview</h3>
+			<pre id="file-content" class="resource-meta">Awaiting content…</pre>
+			<p id="file-preview-note" class="muted"></p>
+		</div>
+		<div class="file-actions">
+			<button type="button" id="file-refresh">Reload preview</button>
+		</div>
+	</div>
+`;
+  const statusEl = document.getElementById("file-status");
+  const previewEl = document.getElementById("file-content");
+  const noteEl = document.getElementById("file-preview-note");
+  const downloadLink = document.getElementById("file-download");
+  const mimeEl = document.getElementById("file-mime");
+  const sizeEl = document.getElementById("file-size");
+  const refreshButton = document.getElementById("file-refresh");
+  const params = new URLSearchParams(window.location.search);
+  const remoteNodeId = params.get("node");
+  const remotePath = params.get("path");
+  const downloadUrl = `${getServerAddr()}/api/file/hash?hash=${encodeURIComponent(hash)}`;
+  const updateDownloadLink = (url) => {
+    if (!downloadLink)
+      return;
+    if (url) {
+      downloadLink.href = url;
+    } else {
+      downloadLink.removeAttribute("href");
+    }
+  };
+  updateDownloadLink(downloadUrl);
+  const preview = createPreviewRenderer(previewEl, noteEl);
+  const loadFile = async () => {
+    if (statusEl)
+      statusEl.textContent = "Loading file data…";
+    if (previewEl)
+      previewEl.textContent = "";
+    if (noteEl)
+      noteEl.textContent = "";
+    preview.cleanup();
+    try {
+      const result = await fetchFileByHash(hash);
+      if (mimeEl)
+        mimeEl.textContent = result.mime;
+      if (sizeEl)
+        sizeEl.textContent = formatBytes3(result.length);
+      if (statusEl) {
+        statusEl.textContent = `Loaded ${formatBytes3(result.length)} (${result.mime})`;
+      }
+      preview.render(result, downloadUrl);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (remoteNodeId && remotePath) {
+        const handled = await loadRemoteFallback();
+        if (handled) {
+          return;
+        }
+      }
+      if (statusEl)
+        statusEl.textContent = `Failed to load file: ${message}`;
+      if (previewEl)
+        previewEl.textContent = "";
+      if (noteEl)
+        noteEl.textContent = "";
+    }
+  };
+  const loadRemoteFallback = async () => {
+    if (!remoteNodeId || !remotePath) {
+      return false;
+    }
+    try {
+      const state = await fetchState();
+      const peer = state.peers.find((entry) => entry.node_id === remoteNodeId);
+      if (!peer) {
+        return false;
+      }
+      const chunk = await fetchPeerFileChunk(peer.id, remotePath, previewLimit);
+      const data = new Uint8Array(chunk.data);
+      const remoteResult = {
+        data,
+        mime: guessMimeFromPath(remotePath),
+        length: data.length,
+        status: chunk.eof ? 200 : 206
+      };
+      if (mimeEl)
+        mimeEl.textContent = remoteResult.mime;
+      if (sizeEl)
+        sizeEl.textContent = formatBytes3(remoteResult.length);
+      if (statusEl) {
+        statusEl.textContent = `Loaded ${formatBytes3(remoteResult.length)} (${peer.name ?? peer.id})`;
+      }
+      const remoteUrl = `${getServerAddr()}/api/peers/${encodeURIComponent(peer.id)}/file?path=${encodeURIComponent(remotePath)}`;
+      preview.render(remoteResult, remoteUrl);
+      updateDownloadLink(remoteUrl);
+      if (noteEl) {
+        noteEl.textContent = `Remote path: ${escapeHtml6(remotePath)}`;
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  refreshButton?.addEventListener("click", () => {
+    loadFile();
+  });
+  loadFile();
+};
+var renderFileByPath = async (peerId, path) => {
+  const content = ensureShell("/file");
+  content.innerHTML = `
+	<section class="hero">
+		<h1>File</h1>
+		<p class="lede">Viewing file contents for ${escapeHtml6(path)}</p>
+	</section>
+	<div class="card" id="file-card">
+		<div class="card-heading">
+			<h2>File preview</h2>
+			<p id="file-status" class="muted">Loading file data…</p>
+		</div>
+		<div class="file-meta">
+			<p><span class="muted">Path:</span> ${escapeHtml6(path)}</p>
+			<p><span class="muted">Download:</span> <a id="file-download" target="_blank" rel="noreferrer">Raw download</a></p>
+			<p><span class="muted">MIME:</span> <span id="file-mime">-</span></p>
+			<p><span class="muted">Size:</span> <span id="file-size">-</span></p>
+		</div>
+		<div class="file-preview">
+			<h3>Preview</h3>
+			<pre id="file-content" class="resource-meta">Awaiting content…</pre>
+			<p id="file-preview-note" class="muted"></p>
+		</div>
+		<div class="file-actions">
+			<button type="button" id="file-refresh">Reload preview</button>
+		</div>
+	</div>
+`;
+  const statusEl = document.getElementById("file-status");
+  const previewEl = document.getElementById("file-content");
+  const noteEl = document.getElementById("file-preview-note");
+  const downloadLink = document.getElementById("file-download");
+  const mimeEl = document.getElementById("file-mime");
+  const sizeEl = document.getElementById("file-size");
+  const refreshButton = document.getElementById("file-refresh");
+  const updateDownloadLink = (url) => {
+    if (!downloadLink)
+      return;
+    if (url) {
+      downloadLink.href = url;
+    } else {
+      downloadLink.removeAttribute("href");
+    }
+  };
+  const preview = createPreviewRenderer(previewEl, noteEl);
+  const loadFile = async () => {
+    if (statusEl)
+      statusEl.textContent = "Loading file data…";
+    if (previewEl)
+      previewEl.textContent = "";
+    if (noteEl)
+      noteEl.textContent = "";
+    preview.cleanup();
+    try {
+      const chunk = await fetchPeerFileChunk(peerId, path, previewLimit);
+      const data = new Uint8Array(chunk.data);
+      const result = {
+        data,
+        mime: guessMimeFromPath(path),
+        length: data.length,
+        status: chunk.eof ? 200 : 206
+      };
+      if (mimeEl)
+        mimeEl.textContent = result.mime;
+      if (sizeEl)
+        sizeEl.textContent = formatBytes3(result.length);
+      if (statusEl) {
+        statusEl.textContent = `Loaded ${formatBytes3(result.length)} (${peerId})`;
+      }
+      const downloadUrl = `${getServerAddr()}/api/peers/${encodeURIComponent(peerId)}/file?path=${encodeURIComponent(path)}`;
+      updateDownloadLink(downloadUrl);
+      preview.render(result, downloadUrl);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (statusEl)
+        statusEl.textContent = `Failed to load file: ${message}`;
+    }
+  };
+  refreshButton?.addEventListener("click", () => {
+    loadFile();
+  });
+  loadFile();
+};
+
 // src/app.ts
 var serverAddr2 = getServerAddr();
 window.onload = () => {
@@ -1870,6 +2605,13 @@ window.onload = () => {
     "/storage": () => renderStorage(),
     "/updates": () => renderUpdates(),
     "/settings": () => renderSettings(),
+    "/file": () => {
+      const params = new URLSearchParams(window.location.search);
+      const peerId = params.get("peer") ?? "";
+      const path = params.get("path") ?? "";
+      return renderFileByPath(peerId, path);
+    },
+    "/file/:hash": ({ hash }) => renderFileByHash(hash),
     "/*": () => renderHome()
   });
   console.info("Using server address:", serverAddr2);

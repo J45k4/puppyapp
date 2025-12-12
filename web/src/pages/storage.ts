@@ -1,6 +1,7 @@
 import { ensureShell } from "../layout"
 import { fetchStorageUsage } from "../api"
 import type { StorageUsageFile } from "../api"
+import { createTreeView, type TreeNode } from "../treeview"
 
 type StorageEntry = {
 	path: string
@@ -23,8 +24,6 @@ type StoragePageState = {
 	nodes: StorageNode[]
 	loading: boolean
 	error: string | null
-	expandedNodes: Set<number>
-	expandedEntries: Set<string>
 	customStatus: string | null
 }
 
@@ -247,9 +246,101 @@ export const renderStorage = async () => {
 		nodes: [],
 		loading: true,
 		error: null,
-		expandedNodes: new Set(),
-		expandedEntries: new Set(),
 		customStatus: null,
+	}
+
+	const buildEntryNodes = (
+		nodeId: string,
+		entries: StorageEntry[],
+	): TreeNode<StorageEntry>[] =>
+		entries.map((entry) => ({
+			id: `${nodeId}:${entry.path}`,
+			label: entry.name,
+			sublabel: entry.path,
+			data: entry,
+			children: buildEntryNodes(nodeId, entry.children),
+		}))
+
+	const renderRow = (
+		node: TreeNode<StorageEntry | StorageNode>,
+		depth: number,
+		expanded: boolean,
+		hasChildren: boolean,
+	) => {
+		const row = document.createElement("div")
+		row.className = "storage-row storage-tree-row"
+		row.setAttribute("data-tree-id", node.id)
+		row.style.setProperty("--tree-depth", String(depth))
+		const data = node.data as StorageEntry | StorageNode
+		const isTopNode = (data as StorageNode).entries !== undefined
+		if (isTopNode) {
+			const storageNode = data as StorageNode
+			row.innerHTML = `
+				<div class="storage-cell storage-name storage-tree-name">
+					${
+						hasChildren
+							? `<button type="button" class="link-btn" data-tree-toggle="${node.id}">${
+									expanded ? "▾" : "▸"
+							  }</button>`
+							: `<span class="storage-toggle-placeholder"></span>`
+					}
+					<div class="storage-name-content">
+						<strong>${escapeHtml(storageNode.name)}</strong>
+						<p class="muted storage-node-id">${escapeHtml(storageNode.id)}</p>
+					</div>
+				</div>
+				<div class="storage-cell">100%</div>
+				<div class="storage-cell">${formatSize(storageNode.totalSize)}</div>
+				<div class="storage-cell">-</div>
+				<div class="storage-cell muted">-</div>
+				<div class="storage-cell"></div>
+			`
+			return row
+		}
+		const entry = data as StorageEntry
+		const openButton = hasChildren
+			? ""
+			: `<button type="button" class="link-btn" data-entry-open="${escapeHtml(
+					entry.path,
+			  )}">Open</button>`
+		row.innerHTML = `
+			<div class="storage-cell storage-name storage-tree-name">
+				${
+					hasChildren
+						? `<button type="button" class="link-btn" data-tree-toggle="${node.id}">${
+								expanded ? "▾" : "▸"
+						  }</button>`
+						: `<span class="storage-toggle-placeholder"></span>`
+				}
+				<div class="storage-name-content">
+					<strong>${escapeHtml(entry.name)}</strong>
+					<p class="muted">${escapeHtml(entry.path)}</p>
+				</div>
+			</div>
+			<div class="storage-cell">${entry.percent.toFixed(1)}%</div>
+			<div class="storage-cell">${formatSize(entry.size)}</div>
+			<div class="storage-cell">${entry.itemCount}</div>
+			<div class="storage-cell">${formatTimestamp(entry.lastChanged)}</div>
+			<div class="storage-cell">${openButton}</div>
+		`
+		return row
+	}
+
+	const tree = createTreeView<StorageEntry | StorageNode>({
+		nodes: [],
+		className: "storage-tree",
+		renderRow,
+		onSelect: (node) => {
+			const data = node.data as StorageEntry | StorageNode
+			if ((data as StorageEntry).path !== undefined) {
+				const entry = data as StorageEntry
+				state.customStatus = `Selected ${entry.path}`
+				updateStatus()
+			}
+		},
+	})
+	if (listEl) {
+		listEl.appendChild(tree.element)
 	}
 
 	const updateStatus = () => {
@@ -269,103 +360,39 @@ export const renderStorage = async () => {
 		}
 	}
 
-	const renderEntries = (nodeIndex: number, entries: StorageEntry[], depth: number): string =>
-		entries
-			.map((entry) => {
-				const entryKey = `${nodeIndex}:${entry.path}`
-				const isExpanded = state.expandedEntries.has(entryKey)
-				const hasChildren = entry.children.length > 0
-				const toggleLabel = hasChildren ? (isExpanded ? "▾" : "▸") : ""
-				const openButton = hasChildren
-					? ""
-					: `<button type="button" class="link-btn" data-entry-open="${escapeHtml(
-							entry.path,
-					  )}">Open</button>`
-				return `
-					<div class="storage-row storage-entry-row">
-						<div class="storage-cell storage-entry-name">
-							${hasChildren ? `<button type="button" class="link-btn" data-entry-toggle="${entryKey}">${toggleLabel}</button>` : "<span class=\"storage-toggle-placeholder\"></span>"}
-							<div class="storage-name-content" style="margin-left: ${depth * 16}px">
-								<strong>${escapeHtml(entry.name)}</strong>
-								<p class="muted">${escapeHtml(entry.path)}</p>
-							</div>
-						</div>
-						<div class="storage-cell">${entry.percent.toFixed(1)}%</div>
-						<div class="storage-cell">${formatSize(entry.size)}</div>
-						<div class="storage-cell">${entry.itemCount}</div>
-						<div class="storage-cell">${formatTimestamp(entry.lastChanged)}</div>
-						<div class="storage-cell">${openButton}</div>
-					</div>
-					${isExpanded ? `<div class="storage-entry-children">${renderEntries(nodeIndex, entry.children, depth + 1)}</div>` : ""}
-				`
-			})
-			.join("")
-
-	const renderNode = (node: StorageNode, index: number) => {
-		const isExpanded = state.expandedNodes.has(index)
-		const toggleLabel = node.entries.length ? (isExpanded ? "▾" : "▸") : ""
-		return `
-			<div class="storage-node">
-				<div class="storage-row storage-node-row">
-					<div class="storage-cell storage-name">
-						${node.entries.length ? `<button type="button" class="link-btn" data-node-index="${index}">${toggleLabel}</button>` : "<span class=\"storage-toggle-placeholder\"></span>"}
-						<div class="storage-name-content">
-							<strong>${escapeHtml(node.name)}</strong>
-							<p class="muted storage-node-id">${escapeHtml(node.id)}</p>
-						</div>
-					</div>
-					<div class="storage-cell">100%</div>
-					<div class="storage-cell">${formatSize(node.totalSize)}</div>
-					<div class="storage-cell">-</div>
-					<div class="storage-cell muted">-</div>
-					<div class="storage-cell"></div>
-				</div>
-				${isExpanded ? `<div class="storage-entries">${renderEntries(index, node.entries, 1)}</div>` : ""}
-			</div>
-		`
-	}
-
 	const updateStorageView = () => {
 		if (!listEl) return
 		if (state.loading) {
 			listEl.innerHTML = `<p class="muted">Loading storage usage...</p>`
+			listEl.appendChild(tree.element)
+			tree.setNodes([])
 		} else if (state.error) {
 			const errorMessage = escapeHtml(state.error ?? "Unknown error")
 			listEl.innerHTML = `<p class="muted">Error: ${errorMessage}</p>`
+			listEl.appendChild(tree.element)
+			tree.setNodes([])
 		} else if (!state.nodes.length) {
 			listEl.innerHTML = `<p class="muted">No storage data available.</p>`
+			listEl.appendChild(tree.element)
+			tree.setNodes([])
 		} else {
-			listEl.innerHTML = state.nodes.map(renderNode).join("")
+			const nodes: TreeNode<StorageEntry | StorageNode>[] = state.nodes.map(
+				(storageNode) => {
+					const nodeId = `node:${storageNode.id}`
+					return {
+						id: nodeId,
+						label: storageNode.name,
+						sublabel: storageNode.id,
+						data: storageNode,
+						children: buildEntryNodes(nodeId, storageNode.entries),
+					}
+				},
+			)
+			listEl.innerHTML = ""
+			listEl.appendChild(tree.element)
+			tree.setNodes(nodes)
 		}
 		updateStatus()
-		if (!listEl) return
-		const nodeButtons = listEl.querySelectorAll<HTMLButtonElement>("[data-node-index]")
-		nodeButtons.forEach((btn) => {
-			btn.addEventListener("click", () => {
-				const value = btn.getAttribute("data-node-index")
-				if (!value) return
-				const index = Number(value)
-				if (state.expandedNodes.has(index)) {
-					state.expandedNodes.delete(index)
-				} else {
-					state.expandedNodes.add(index)
-				}
-				updateStorageView()
-			})
-		})
-		const entryToggleButtons = listEl.querySelectorAll<HTMLButtonElement>("[data-entry-toggle]")
-		entryToggleButtons.forEach((btn) => {
-			btn.addEventListener("click", () => {
-				const key = btn.getAttribute("data-entry-toggle")
-				if (!key) return
-				if (state.expandedEntries.has(key)) {
-					state.expandedEntries.delete(key)
-				} else {
-					state.expandedEntries.add(key)
-				}
-				updateStorageView()
-			})
-		})
 		const entryOpenButtons = listEl.querySelectorAll<HTMLButtonElement>("[data-entry-open]")
 		entryOpenButtons.forEach((btn) => {
 			btn.addEventListener("click", () => {
@@ -382,8 +409,6 @@ export const renderStorage = async () => {
 		state.error = null
 		state.customStatus = null
 		state.nodes = []
-		state.expandedNodes.clear()
-		state.expandedEntries.clear()
 		updateStorageView()
 
 		try {
